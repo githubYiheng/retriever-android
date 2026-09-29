@@ -1,0 +1,25 @@
+[versions]
+# Android SDK 基线：library minSdk 24（宿主下限）/ example minSdk 26 / compileSdk 36 / targetSdk 36
+android-compileSdk = "36"
+android-minSdk = "24"
+android-exampleMinSdk = "26"
+android-targetSdk = "36"
+
+# 工具链沿用 revenue-dog `sdk/android/gradle/libs.versions.toml`（AGP 9.4.0 要求 Gradle ≥ 9.6、JDK ≥ 17）。
+agp = "9.4.0"
+kotlin = "2.4.20"
+# 产物 Kotlin 语言版本：宿主 bible_bff_android 用 Kotlin 2.2，下限取 2.0（metadata 版本 = 它）。
+kotlinLanguage = "2.0"
+# POM / Gradle module 里声明的 kotlin-stdlib（`kotlin.coreLibrariesVersion`），与 kotlinLanguage 同一小版本。
+kotlinStdlib = "2.0.21"
+
+timber = "5.0.1"
+junit = "4.13.2"
+
+[libraries]
+timber = { module = "com.jakewharton.timber:timber", version.ref = "timber" }
+junit = { module = "junit:junit", version.ref = "junit" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="no_key_hint">未配置 key：只写本地不上传（运行 example/gen-local-properties.sh 后重新构建）</string>
+    <string name="status_format">installId：%1$s\nsupportCode：%2$s\n出站箱待传：%3$d\n上传级别：%4$s\n本地级别：%5$s\nuser：%6$s</string>
+</resources>

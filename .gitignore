@@ -1,0 +1,9 @@
+# 本文件随公开发布镜像分发，必须自足（不依赖 monorepo 根 .gitignore）
+build/
+.gradle/
+.kotlin/
+.idea/
+*.iml
+local.properties
+*.local.properties
+.DS_Store

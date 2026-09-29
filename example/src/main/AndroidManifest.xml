@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      INTERNET / ACCESS_NETWORK_STATE / RECEIVE_BOOT_COMPLETED、JobService 与初始化 provider
+      都由 retriever aar 的 manifest 合并进来，宿主不必重复声明。
+    -->
+    <application
+        android:name=".ExampleApp"
+        android:allowBackup="false"
+        android:label="Retriever 示例">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 上传批次与拉远程配置 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- registerDefaultNetworkCallback（只用于提前唤醒）与 NET_CAPABILITY_NOT_METERED 判断（backfill 只走非计量网络） -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- JobInfo.Builder.setPersisted(true) 的前提：没有它 schedule() 直接抛 IllegalArgumentException -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <application>
+        <!--
+          后台兜底上传（方案 §3.9；ADR 0003 决定 13）：进后台 / fatal 时排一个一次性作业，
+          网络约束、持久化；只有系统（持有 BIND_JOB_SERVICE）能绑定它。
+        -->
+        <service
+            android:name="org.revdog.retriever.RetrieverUploadJobService"
+            android:exported="true"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <!--
+          只记下 Application context（不做任何磁盘 I/O），让 configure 之前的 log() 也能落盘
+          （方案 §3.10「存储层不依赖 key」）。只在默认进程实例化；宿主可用 tools:node="remove" 去掉。
+        -->
+        <provider
+            android:name="org.revdog.retriever.RetrieverInitProvider"
+            android:authorities="${applicationId}.retriever-init"
+            android:exported="false" />
+    </application>
+</manifest>

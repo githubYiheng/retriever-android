@@ -4,6 +4,7 @@ import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 plugins {
     alias(libs.plugins.android.library)
+    alias(libs.plugins.metalava)
     `maven-publish`
 }
 
@@ -79,7 +80,9 @@ afterEvaluate {
         repositories {
             maven {
                 name = "staging"
-                url = uri(layout.buildDirectory.dir("maven-staging"))
+                // 两个模块发到**同一个** staging 根（`sdk/android/build/maven-staging`），
+                // 这样 `scripts/sdk-android-maven-publish.sh` 只有一个目录要拉 metadata、验产物、上传。
+                url = uri(rootProject.layout.buildDirectory.dir("maven-staging"))
             }
         }
     }
@@ -106,4 +109,10 @@ dependencies {
     api(project(":retriever"))
     api(libs.timber)
     testImplementation(libs.junit)
+}
+
+// metalava：公开 API 基线（同 :retriever；`scripts/api-dump.sh` 生成、`scripts/api-check.sh` 门禁）。
+metalava {
+    filename.set("api/retriever-timber.api")
+    arguments.addAll(listOf("--hide", "ReferencesHidden"))
 }

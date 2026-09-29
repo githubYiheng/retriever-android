@@ -4,6 +4,7 @@ import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 plugins {
     alias(libs.plugins.android.library)
+    alias(libs.plugins.metalava)
     `maven-publish`
 }
 
@@ -45,7 +46,7 @@ android {
     }
 }
 
-// Maven 发布：只发到本地 staging 目录（照 revenue-dog；上传与门禁在发布脚本里，下一切片）。
+// Maven 发布：只发到本地 staging 目录（照 revenue-dog；上传与门禁在 `scripts/sdk-android-maven-publish.sh`）。
 //   ./gradlew :retriever:publishReleasePublicationToStagingRepository
 afterEvaluate {
     publishing {
@@ -83,7 +84,9 @@ afterEvaluate {
         repositories {
             maven {
                 name = "staging"
-                url = uri(layout.buildDirectory.dir("maven-staging"))
+                // 两个模块发到**同一个** staging 根（`sdk/android/build/maven-staging`），
+                // 这样 `scripts/sdk-android-maven-publish.sh` 只有一个目录要拉 metadata、验产物、上传。
+                url = uri(rootProject.layout.buildDirectory.dir("maven-staging"))
             }
         }
     }
@@ -125,4 +128,11 @@ tasks.withType<Test>().configureEach {
 
 dependencies {
     testImplementation(libs.junit)
+}
+
+// metalava：公开 API 基线（照 revenue-dog；`scripts/api-dump.sh` 生成、`scripts/api-check.sh` 门禁）。
+// 公开面靠 `-Xexplicit-api=strict` + `internal` 划定，没有 hidden 注解；BuildConfig 已关，不进基线。
+metalava {
+    filename.set("api/retriever.api")
+    arguments.addAll(listOf("--hide", "ReferencesHidden"))
 }

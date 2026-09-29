@@ -1,0 +1,161 @@
+// Signature format: 4.0
+package org.revdog.retriever {
+
+  public fun interface FlushCallback {
+    method public void onResult(org.revdog.retriever.FlushResult result);
+  }
+
+  public abstract sealed exhaustive class FlushResult {
+  }
+
+  public static final class FlushResult.Pending extends org.revdog.retriever.FlushResult {
+    ctor public FlushResult.Pending(String reason);
+    method public String component1();
+    method public org.revdog.retriever.FlushResult.Pending copy(optional String reason);
+    method @InaccessibleFromKotlin public String getReason();
+    property public String reason;
+  }
+
+  public static final class FlushResult.Stored extends org.revdog.retriever.FlushResult {
+    field public static final org.revdog.retriever.FlushResult.Stored INSTANCE;
+  }
+
+  public final class LogException {
+    ctor public LogException(String type, String message, String? stack);
+    method public String component1();
+    method public String component2();
+    method public String? component3();
+    method public org.revdog.retriever.LogException copy(optional String type, optional String message, optional String? stack);
+    method @InaccessibleFromKotlin public String getMessage();
+    method @InaccessibleFromKotlin public String? getStack();
+    method @InaccessibleFromKotlin public String getType();
+    property public String message;
+    property public String? stack;
+    property public String type;
+  }
+
+  public enum LogLevel {
+    enum_constant public static final org.revdog.retriever.LogLevel DEBUG;
+    enum_constant public static final org.revdog.retriever.LogLevel ERROR;
+    enum_constant public static final org.revdog.retriever.LogLevel FATAL;
+    enum_constant public static final org.revdog.retriever.LogLevel INFO;
+    enum_constant public static final org.revdog.retriever.LogLevel WARN;
+  }
+
+  public final class LogLine {
+    ctor public LogLine(long ts, org.revdog.retriever.LogLevel level, String msg, String? tag, java.util.Map<java.lang.String,? extends java.lang.Object?>? attrs, org.revdog.retriever.LogException? exc);
+    method public long component1();
+    method public org.revdog.retriever.LogLevel component2();
+    method public String component3();
+    method public String? component4();
+    method public java.util.Map<java.lang.String,java.lang.Object?>? component5();
+    method public org.revdog.retriever.LogException? component6();
+    method public org.revdog.retriever.LogLine copy(optional long ts, optional org.revdog.retriever.LogLevel level, optional String msg, optional String? tag, optional java.util.Map<java.lang.String,? extends java.lang.Object?>? attrs, optional org.revdog.retriever.LogException? exc);
+    method @InaccessibleFromKotlin public java.util.Map<java.lang.String,java.lang.Object?>? getAttrs();
+    method @InaccessibleFromKotlin public org.revdog.retriever.LogException? getExc();
+    method @InaccessibleFromKotlin public org.revdog.retriever.LogLevel getLevel();
+    method @InaccessibleFromKotlin public String getMsg();
+    method @InaccessibleFromKotlin public String? getTag();
+    method @InaccessibleFromKotlin public long getTs();
+    property public java.util.Map<java.lang.String,java.lang.Object?>? attrs;
+    property public org.revdog.retriever.LogException? exc;
+    property public org.revdog.retriever.LogLevel level;
+    property public String msg;
+    property public String? tag;
+    property public long ts;
+  }
+
+  public final class Options {
+    ctor public Options();
+    method @InaccessibleFromKotlin public int getDailyBatchCap();
+    method @InaccessibleFromKotlin public int getJobId();
+    method @InaccessibleFromKotlin public long getLocalCapBytes();
+    method @InaccessibleFromKotlin public org.revdog.retriever.LogLevel getLocalLevel();
+    method @InaccessibleFromKotlin public String? getProcessName();
+    method @InaccessibleFromKotlin public kotlin.jvm.functions.Function1<org.revdog.retriever.LogLine,org.revdog.retriever.LogLine?>? getRedact();
+    method @InaccessibleFromKotlin public String getSdkVersion();
+    method @InaccessibleFromKotlin public org.revdog.retriever.LogLevel getUploadLevel();
+    method @InaccessibleFromKotlin public void setDailyBatchCap(int);
+    method @InaccessibleFromKotlin public void setJobId(int);
+    method @InaccessibleFromKotlin public void setLocalCapBytes(long);
+    method @InaccessibleFromKotlin public void setLocalLevel(org.revdog.retriever.LogLevel);
+    method @InaccessibleFromKotlin public void setProcessName(String?);
+    method @InaccessibleFromKotlin public void setRedact(kotlin.jvm.functions.Function1<? super org.revdog.retriever.LogLine,org.revdog.retriever.LogLine?>?);
+    method @InaccessibleFromKotlin public void setSdkVersion(String);
+    method @InaccessibleFromKotlin public void setUploadLevel(org.revdog.retriever.LogLevel);
+    property public int dailyBatchCap;
+    property public int jobId;
+    property public long localCapBytes;
+    property public org.revdog.retriever.LogLevel localLevel;
+    property public String? processName;
+    property public kotlin.jvm.functions.Function1<org.revdog.retriever.LogLine,org.revdog.retriever.LogLine?>? redact;
+    property public String sdkVersion;
+    property public org.revdog.retriever.LogLevel uploadLevel;
+  }
+
+  public final class Retriever {
+    method public static void configure(android.content.Context context, String key);
+    method public static void configure(android.content.Context context, String key, optional String baseUrl);
+    method public static void configure(android.content.Context context, String key, optional String baseUrl, optional org.revdog.retriever.Options options);
+    method public static void flush(optional boolean includeContext, org.revdog.retriever.FlushCallback callback);
+    method public static void flush(org.revdog.retriever.FlushCallback callback);
+    method @InaccessibleFromKotlin public static String? getInstallId();
+    method @InaccessibleFromKotlin public static org.revdog.retriever.LogLevel getLocalLevel();
+    method @InaccessibleFromKotlin public static String? getSupportCode();
+    method @InaccessibleFromKotlin public static org.revdog.retriever.LogLevel getUploadLevel();
+    method public static void log(org.revdog.retriever.LogLevel level, String? msg);
+    method public static void log(org.revdog.retriever.LogLevel level, String? msg, optional String? tag);
+    method public static void log(org.revdog.retriever.LogLevel level, String? msg, optional String? tag, optional java.util.Map<java.lang.String,? extends java.lang.Object?>? attrs);
+    method public static void log(org.revdog.retriever.LogLevel level, String? msg, optional String? tag, optional java.util.Map<java.lang.String,? extends java.lang.Object?>? attrs, optional Throwable? error);
+    method public static void purgeLocal();
+    method public static void setEnabled(boolean enabled);
+    method public static void setUser(String? id);
+    property public static String? installId;
+    property public static org.revdog.retriever.LogLevel localLevel;
+    property public static String? supportCode;
+    property public static org.revdog.retriever.LogLevel uploadLevel;
+    field public static final org.revdog.retriever.Retriever INSTANCE;
+  }
+
+  public final class RetrieverInitProvider extends android.content.ContentProvider {
+    ctor public RetrieverInitProvider();
+    method public int delete(android.net.Uri uri, String? selection, String[]? selectionArgs);
+    method public String? getType(android.net.Uri uri);
+    method public android.net.Uri? insert(android.net.Uri uri, android.content.ContentValues? values);
+    method public boolean onCreate();
+    method public android.database.Cursor? query(android.net.Uri uri, String[]? projection, String? selection, String[]? selectionArgs, String? sortOrder);
+    method public int update(android.net.Uri uri, android.content.ContentValues? values, String? selection, String[]? selectionArgs);
+  }
+
+  public final class RetrieverLog {
+    method public static int d(String? tag, String? msg);
+    method public static int d(String? tag, String? msg, optional Throwable? tr);
+    method public static int e(String? tag, String? msg);
+    method public static int e(String? tag, String? msg, optional Throwable? tr);
+    method public static int i(String? tag, String? msg);
+    method public static int i(String? tag, String? msg, optional Throwable? tr);
+    method public static int v(String? tag, String? msg);
+    method public static int v(String? tag, String? msg, optional Throwable? tr);
+    method public static int w(String? tag, String? msg);
+    method public static int w(String? tag, String? msg, optional Throwable? tr);
+    method public static int w(String? tag, Throwable? tr);
+    method public static int wtf(String? tag, String? msg);
+    method public static int wtf(String? tag, String? msg, optional Throwable? tr);
+    method public static int wtf(String? tag, Throwable? tr);
+    field public static final org.revdog.retriever.RetrieverLog INSTANCE;
+  }
+
+  public final class RetrieverUploadJobService extends android.app.job.JobService {
+    ctor public RetrieverUploadJobService();
+    method public boolean onStartJob(android.app.job.JobParameters params);
+    method public boolean onStopJob(android.app.job.JobParameters params);
+  }
+
+  public final class RetrieverVersion {
+    property public static String CURRENT;
+    field public static final String CURRENT = "0.1.0";
+    field public static final org.revdog.retriever.RetrieverVersion INSTANCE;
+  }
+
+}
+

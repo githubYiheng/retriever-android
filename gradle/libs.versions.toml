@@ -16,6 +16,9 @@ kotlinStdlib = "2.0.21"
 timber = "5.0.1"
 junit = "4.13.2"
 
+# 公开 API 基线（照 revenue-dog）：`scripts/api-dump.sh` / `api-check.sh`。
+metalava = "0.5.1"
+
 [libraries]
 timber = { module = "com.jakewharton.timber:timber", version.ref = "timber" }
 junit = { module = "junit:junit", version.ref = "junit" }
@@ -23,3 +26,4 @@ junit = { module = "junit:junit", version.ref = "junit" }
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
 android-library = { id = "com.android.library", version.ref = "agp" }
+metalava = { id = "me.tylerbwong.gradle.metalava", version.ref = "metalava" }

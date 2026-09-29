@@ -8,7 +8,7 @@ Kotlin，minSdk 24 / compileSdk 36，JVM 17。规格：`docs/plan/system-design.
 | `retriever` | `org.revdog:retriever:0.1.0` | **只有 kotlin-stdlib**（无 AndroidX、无 coroutines、无 okhttp） | 传输层本体 + `RetrieverLog`（`android.util.Log` 替身） |
 | `retriever-timber` | `org.revdog:retriever-timber:0.1.0` | `:retriever` + `com.jakewharton.timber:timber:5.0.1` | `RetrieverTree` |
 
-产物 Kotlin 语言版本 2.0（POM 里的 kotlin-stdlib = 2.0.21），宿主 Kotlin ≥ 2.0 即可。发布渠道（`maven.revdog.org`）与 metalava / R8 门禁脚本在下一切片。
+产物 Kotlin 语言版本 2.0（POM 里的 kotlin-stdlib = 2.0.21），宿主 Kotlin ≥ 2.0 即可。发布渠道：自托管 Maven 仓库 `https://maven.revdog.org/releases`（ADR 0006，与 revenue-dog 共用）+ 公开只读源码镜像 `githubYiheng/retriever-android`；门禁与发布脚本见文末「发布」。
 
 ## 接入
 
@@ -117,3 +117,44 @@ adb shell am start -n org.revdog.retriever.example/.MainActivity --es scenario e
 单测覆盖：golden 向量（ids / client_day / config clamp）、`validate-envelope.ts` 跨语言校验（原始信封字节）、gzip（`GZIPInputStream` + `gunzip -t`）、
 队列状态机、段与物化、驱逐、配置、生命周期与 JobScheduler 调度、多进程、写入纪律、UTF-8 截断、**真杀进程**
 （子 JVM 写 5000 行后 `Runtime.halt(137)`，父进程恢复；另测残行）、`log()` 1 万次 p99。
+
+## 发布
+
+monorepo 是唯一开发源；公开仓库 `githubYiheng/retriever-android` 只读（`git subtree split --prefix=sdk/android` 推送，改动一律回 monorepo）。
+两个脚本都在仓库根、默认 dry-run，`--apply` 才真推 / 真传。**顺序固定：先 `sdk-android-release.sh --apply`，再 `sdk-android-maven-publish.sh --apply`**
+（后者的门禁 3 要求公开仓库已有 tag 且树 == `HEAD:sdk/android`，保证 Maven 上的制品与 GitHub 上的源码同源）。
+
+```bash
+scripts/sdk-android-release.sh 0.1.0                # 八道门禁 + subtree split + git push --dry-run
+scripts/sdk-android-release.sh 0.1.0 --apply        # 推 retriever-android main + tag v0.1.0
+scripts/sdk-android-maven-publish.sh 0.1.0          # 六道门禁 + Gradle 发到 staging + 列出将上传的对象
+scripts/sdk-android-maven-publish.sh 0.1.0 --apply  # wrangler 传 R2 `revdog-maven` + 回读校验
+```
+
+- 源码发布八道门禁：CHANGELOG 有 `## [X.Y.Z]`；工作区干净；两个模块 JVM 单测；`scripts/api-check.sh`（metalava 基线）；
+  `RetrieverVersion.CURRENT` == `VERSION_NAME` == 参数（且 `Options.sdkVersion` 默认引用它）；tag 不存在；远端 main fast-forward；
+  `scripts/r8-check.sh`（`SKIP_R8=1` 可跳，跳过 ≠ 通过）。另查 split 树无 `build/`、`.gradle/`、`local.properties` / `*.local.properties`、keystore、真 key。
+- 制品发布六道门禁：版本 == `VERSION_NAME`；工作区干净；tag 树 == `HEAD:sdk/android`；两个 artifact 的裸 pom 远端都 404（版本不可变，不覆盖）；
+  分别拉回两份 `maven-metadata.xml`；staging（`build/maven-staging`）两个 artifact 的 aar / sources / pom / module 与四种校验和齐全，
+  且 `retriever-timber` 的 pom 依赖同版本 `org.revdog:retriever`。上传顺序：`retriever` 版本目录（裸 pom 最后）→ 其 metadata → `retriever-timber` 同理。
+  凭据只从仓库根 `.env` 读（Cloudflare token），Gradle 侧零凭据。
+
+门禁脚本（在 `sdk/android` 下，也可单独跑）：
+
+```bash
+./scripts/api-dump.sh     # 改了公开面后重新生成 retriever/api/retriever.api、retriever-timber/api/retriever-timber.api，review diff 再提交
+./scripts/api-check.sh    # 基线与代码不一致即失败（破坏性变更必须升主版本）
+./scripts/r8-check.sh     # :example:assembleRelease 后断言：consumer 规则进了 R8 配置、点名的公开类原名保留、关键入口在 seeds、dex 内含
+```
+
+宿主依赖（Maven 发布之后可用；之前只能走源码依赖）：
+
+```kotlin
+// settings.gradle.kts → dependencyResolutionManagement.repositories
+maven { url = uri("https://maven.revdog.org/releases"); content { includeGroup("org.revdog") } }
+// 模块
+implementation("org.revdog:retriever:0.1.0")
+implementation("org.revdog:retriever-timber:0.1.0")   // 可选，宿主已用 Timber 时
+```
+
+升级规则：修订号 = 只修 bug；次版本 = 公开 API 只增；主版本 = 公开 API 有减或改，看 CHANGELOG 迁移说明。

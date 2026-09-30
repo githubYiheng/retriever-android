@@ -5,8 +5,8 @@ Kotlin，minSdk 24 / compileSdk 36，JVM 17。规格：`docs/plan/system-design.
 
 | 模块 | 坐标 | 依赖 | 用途 |
 |---|---|---|---|
-| `retriever` | `org.revdog:retriever:0.1.0` | **只有 kotlin-stdlib**（无 AndroidX、无 coroutines、无 okhttp） | 传输层本体 + `RetrieverLog`（`android.util.Log` 替身） |
-| `retriever-timber` | `org.revdog:retriever-timber:0.1.0` | `:retriever` + `com.jakewharton.timber:timber:5.0.1` | `RetrieverTree` |
+| `retriever` | `org.revdog:retriever:0.1.1` | **只有 kotlin-stdlib**（无 AndroidX、无 coroutines、无 okhttp） | 传输层本体 + `RetrieverLog`（`android.util.Log` 替身） |
+| `retriever-timber` | `org.revdog:retriever-timber:0.1.1` | `:retriever` + `com.jakewharton.timber:timber:5.0.1` | `RetrieverTree` |
 
 产物 Kotlin 语言版本 2.0（POM 里的 kotlin-stdlib = 2.0.21），宿主 Kotlin ≥ 2.0 即可。发布渠道：自托管 Maven 仓库 `https://maven.revdog.org/releases`（ADR 0006，与 revenue-dog 共用）+ 公开只读源码镜像 `githubYiheng/retriever-android`；门禁与发布脚本见文末「发布」。
 
@@ -153,8 +153,8 @@ scripts/sdk-android-maven-publish.sh 0.1.0 --apply  # wrangler 传 R2 `revdog-ma
 // settings.gradle.kts → dependencyResolutionManagement.repositories
 maven { url = uri("https://maven.revdog.org/releases"); content { includeGroup("org.revdog") } }
 // 模块
-implementation("org.revdog:retriever:0.1.0")
-implementation("org.revdog:retriever-timber:0.1.0")   // 可选，宿主已用 Timber 时
+implementation("org.revdog:retriever:0.1.1")
+implementation("org.revdog:retriever-timber:0.1.1")   // 可选，宿主已用 Timber 时
 ```
 
 升级规则：修订号 = 只修 bug；次版本 = 公开 API 只增；主版本 = 公开 API 有减或改，看 CHANGELOG 迁移说明。

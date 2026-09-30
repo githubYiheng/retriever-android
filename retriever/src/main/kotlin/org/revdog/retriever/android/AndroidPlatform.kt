@@ -10,7 +10,6 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
-import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
 import android.os.StrictMode
@@ -42,7 +41,7 @@ internal object AndroidClock : Clock {
 /**
  * Android 平台层（方案 §3.9 Android 列）：
  * - 生命周期：`registerActivityLifecycleCallbacks` 计数 started activities → 前台 / 后台（配置变更重建不算）；
- * - 网络：`registerDefaultNetworkCallback` 的 onAvailable 只用来提前唤醒（不做可达性预检）；计量判断用 NET_CAPABILITY_NOT_METERED；
+ * - 网络：`registerDefaultNetworkCallback` 的 onAvailable 只用来提前唤醒（不做可达性预检）；
  * - 后台兜底：框架 JobScheduler 一次性作业（网络约束、持久化；ADR 0003 决定 13，不引 WorkManager）；
  * - StrictMode：写入处 `allowThreadDiskWrites()` 包住并恢复；栈：`Log.getStackTraceString`。
  */
@@ -200,14 +199,6 @@ internal class AndroidPlatform(private val app: Context) : Platform {
         override fun onLost(network: Network) {
             synchronized(this@AndroidPlatform) { hadNetwork = false }
         }
-    }
-
-    override fun isExpensiveNetwork(): Boolean = try {
-        val cm = app.getSystemService(ConnectivityManager::class.java)
-        val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
-        caps != null && !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
-    } catch (e: RuntimeException) {
-        false
     }
 
     /** 可分配空间（API 26+ `StorageManager.getAllocatableBytes`，含系统可回收的缓存；同 iOS「重要用途」口径）。 */

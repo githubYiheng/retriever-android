@@ -81,7 +81,7 @@ class GoldenTests {
     fun configClamp() {
         val g = Repo.golden("config.json")
         val vs = objs(g["clamp"])
-        assertEquals(53, vs.size)
+        assertEquals(50, vs.size)
         for (v in vs) {
             val name = v["name"] as String
             val h = obj(v["host"])
@@ -103,9 +103,8 @@ class GoldenTests {
             assertEquals(name, int(e["local_cap_bytes"]), c.localCapBytes.toLong())
             assertEquals(name, e["full_dump"], c.fullDump)
             assertEquals(name, int(e["full_dump_ttl_s"]), c.fullDumpTtlS.toLong())
-            assertEquals(name, e["backfill_networks"], c.backfillNetworks)
             assertEquals(name, int(e["daily_batch_cap"]), c.dailyBatchCap.toLong())
-            assertEquals(name, 13, e.keys.size)
+            assertEquals(name, 12, e.keys.size)
             // 缓存文件往返：encode 后再 clamp 得到同一份
             assertEquals(name, c, ConfigRules.clamp(JsonIn.obj(ConfigRules.encode(c)), host))
         }

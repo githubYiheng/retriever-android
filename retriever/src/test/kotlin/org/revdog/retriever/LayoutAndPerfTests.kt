@@ -24,7 +24,7 @@ class LayoutAndPerfTests : RtvTest() {
         val meta = h.readJson(File(h.sessionDir(), "meta.json"))
         assertEquals(1L, int(meta["session_no"]))
         assertEquals("main", meta["process"])
-        assertEquals("retriever-android/0.1.0", obj(meta["device"])["sdk"])
+        assertEquals("retriever-android/${RetrieverVersion.CURRENT}", obj(meta["device"])["sdk"])
         assertEquals("android", obj(meta["device"])["os"])
         for (name in listOf("install.json", "config.json", "backoff.json", "mapping.json", "upload.lock", "outbox", "proc-main")) {
             assertTrue(name, File(h.root, name).exists())

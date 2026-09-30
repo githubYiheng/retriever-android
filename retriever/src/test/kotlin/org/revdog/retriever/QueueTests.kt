@@ -36,7 +36,7 @@ class QueueTests : RtvTest() {
         assertEquals("gzip", r.headers["Content-Encoding"])
         assertEquals(h.client.installId, r.headers["X-Rtv-Install"])
         assertEquals(h.clock.wallMs().toString(), r.headers["X-Rtv-Sent-Ms"])
-        assertEquals("retriever-android/0.1.0", r.headers["X-Rtv-Sdk"])
+        assertEquals("retriever-android/${RetrieverVersion.CURRENT}", r.headers["X-Rtv-Sdk"])
         val e = env(r)
         assertEquals("primary", e["kind"])
         assertEquals(1L, int(e["oseq_from"]))

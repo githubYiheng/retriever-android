@@ -82,7 +82,7 @@ class EnvelopeCrossLangTests : RtvTest() {
             assertEquals("u_1024", obj(cur["mapping"])["user_id"])
             assertEquals("u_1024", cur["user_id"])
             assertEquals("android", obj(cur["device"])["os"])
-            assertEquals("retriever-android/0.1.0", obj(cur["device"])["sdk"])
+            assertEquals("retriever-android/${RetrieverVersion.CURRENT}", obj(cur["device"])["sdk"])
             cases.add(expect("recovered_with_drops_closed", rec))
             cases.add(expect("with_mapping", cur))
         }
@@ -110,7 +110,7 @@ class EnvelopeCrossLangTests : RtvTest() {
             for (i in 0 until 20) h.client.log(if (i % 2 == 0) LogLevel.DEBUG else LogLevel.INFO, "history $i", null, null, null)
             h.client.log(LogLevel.WARN, "w", null, null, null)
             h.seal()
-            h.transport.configBody = mapOf("etag" to "e1", "ttl_s" to 600, "full_dump" to true, "full_dump_ttl_s" to 3600, "backfill_networks" to "any")
+            h.transport.configBody = mapOf("etag" to "e1", "ttl_s" to 600, "full_dump" to true, "full_dump_ttl_s" to 3600)
             h.transport.defaultReply = FakeTransport.Reply.Status(503) // 不确认，批留在出站箱里供检查
             h.enableUpload()
             val bf = h.envelopes("p2").first()

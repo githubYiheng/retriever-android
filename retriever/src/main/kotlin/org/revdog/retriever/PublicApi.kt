@@ -88,5 +88,5 @@ public fun interface FlushCallback {
 
 /** SDK 版本号（唯一来源）：进 `device.sdk = "retriever-android/<ver>"` 与 `X-Rtv-Sdk`；必须 == gradle.properties 的 VERSION_NAME。 */
 public object RetrieverVersion {
-    public const val CURRENT: String = "0.1.0"
+    public const val CURRENT: String = "0.1.1"
 }

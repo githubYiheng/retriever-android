@@ -3,7 +3,7 @@
 
     <!-- 上传批次与拉远程配置 -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- registerDefaultNetworkCallback（只用于提前唤醒）与 NET_CAPABILITY_NOT_METERED 判断（backfill 只走非计量网络） -->
+    <!-- registerDefaultNetworkCallback（只用于网络恢复时提前唤醒） -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- JobInfo.Builder.setPersisted(true) 的前提：没有它 schedule() 直接抛 IllegalArgumentException -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />

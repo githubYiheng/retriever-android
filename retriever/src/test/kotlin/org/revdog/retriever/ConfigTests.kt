@@ -5,7 +5,6 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.revdog.retriever.core.Limits
-import org.revdog.retriever.core.PlatformEvent
 import java.net.URLDecoder
 
 /** 远程配置（方案 §5；宪法 U-1 / U-2）。与 iOS ConfigTests 同一组。 */
@@ -24,7 +23,7 @@ class ConfigTests : RtvTest() {
         assertEquals("https://logs-test.invalid/v1/config", r.url)
         assertEquals("Bearer lk_test_demo_abc_12345678", r.headers["Authorization"])
         assertEquals(h.client.installId, r.headers["X-Rtv-Install"])
-        assertEquals("retriever-android/0.1.0", r.headers["X-Rtv-Sdk"])
+        assertEquals("retriever-android/${RetrieverVersion.CURRENT}", r.headers["X-Rtv-Sdk"])
         assertEquals("1.2.3", r.headers["X-Rtv-App-Version"])
         assertEquals("warn", r.headers["X-Rtv-Upload-Level"])
         assertEquals("debug", r.headers["X-Rtv-Local-Level"])
@@ -101,23 +100,18 @@ class ConfigTests : RtvTest() {
         assertEquals(3, t.batchRequests.size)
     }
 
+    /** 不看网络类型（ADR 0009）：backfill 批与其它批走同一套队列 / 退避规则，生成后照常上传。 */
     @Test
-    fun backfillWaitsForUnmeteredNetwork() {
+    fun backfillUploadsLikeOtherBatches() {
         val t = FakeTransport()
         val h = Harness(key = "", transport = t)
         h.settle()
         h.client.log(LogLevel.DEBUG, "history", null, null, null)
         h.seal()
-        h.platform.expensive = true
         t.configBody = mapOf("etag" to "fd", "full_dump" to true, "full_dump_ttl_s" to 3600)
         h.enableUpload()
-        assertEquals(1, h.outboxFiles("p2").size)
-        assertEquals("计量网络上不传 backfill", 0, t.batchRequests.size)
-        assertEquals("metered", h.client.lastStop.first)
-        h.platform.expensive = false
-        h.client.platformEvent(PlatformEvent.NETWORK_RESTORED)
-        h.settle()
-        assertEquals(1, t.batchRequests.size)
+        assertEquals("backfill 不等网络，照常上传", 1, t.batchRequests.size)
+        assertEquals("backfill", FakeTransport.envOf(t.batchRequests[0].body)!!["kind"])
         assertEquals(emptyList<String>(), h.outboxFiles())
         assertTrue(h.client.effectiveLevels.first == LogLevel.DEBUG)
     }

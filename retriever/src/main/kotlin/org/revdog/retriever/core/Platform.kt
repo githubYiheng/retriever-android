@@ -59,9 +59,6 @@ internal interface Platform {
 
     fun stopObserving(sink: PlatformEventSink)
 
-    /** 当前网络是否计量（缺 NET_CAPABILITY_NOT_METERED）；未知按 false。 */
-    fun isExpensiveNetwork(): Boolean
-
     /** 可用磁盘空间（null = 未知，不按空间收缩上限）。 */
     fun availableBytes(dir: File): Long?
 

@@ -2,6 +2,11 @@
 
 Retriever monorepo `sdk/android`。版本号遵循语义化版本：修订号 = 只修 bug；次版本 = 公开 API 只增；主版本 = 公开 API 有减或改。
 
+## [0.1.1] - 2026-09-30
+
+- 删除：backfill 批的网络类型判定（原先 `backfill_networks = unmetered` 时计量网络上不传 backfill）与远程配置字段 `backfill_networks`（ADR 0009：任何能力都不再考虑网络类型，该传就传）。backfill 批与其它批按同一套队列 / 退避规则上传；服务端旧配置里残留该字段按未知字段忽略。`ACCESS_NETWORK_STATE` 权限保留（网络恢复提前唤醒仍要用）。
+- 随包带 LICENSE（MIT）。
+
 ## [0.1.0] - 2026-09-29
 
 首个版本。协议 v1（信封 `v: 1`），minSdk 24，Kotlin 语言版本 2.0（stdlib 2.0.21），JVM 17。与 iOS `retriever-ios` 0.1.0 同规格。

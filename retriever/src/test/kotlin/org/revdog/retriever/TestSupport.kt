@@ -257,9 +257,6 @@ internal class FakeTransport : Transport {
 
 internal class FakePlatform : Platform {
     @Volatile
-    var expensive = false
-
-    @Volatile
     var available: Long? = null
 
     @Volatile
@@ -283,8 +280,6 @@ internal class FakePlatform : Platform {
     override fun startObserving(sink: PlatformEventSink) = Unit
 
     override fun stopObserving(sink: PlatformEventSink) = Unit
-
-    override fun isExpensiveNetwork(): Boolean = expensive
 
     override fun availableBytes(dir: File): Long? = available
 

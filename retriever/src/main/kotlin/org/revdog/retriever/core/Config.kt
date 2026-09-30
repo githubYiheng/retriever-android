@@ -16,7 +16,6 @@ internal data class RemoteConfig(
     val localCapBytes: Int,
     val fullDump: Boolean,
     val fullDumpTtlS: Int,
-    val backfillNetworks: String,
     val dailyBatchCap: Int,
 )
 
@@ -44,7 +43,6 @@ internal object ConfigRules {
         val hostUpload = host.uploadLevel
         val hostLocal = host.localLevel ?: LogLevel.DEBUG
         val hostCap = clampInt(host.dailyBatchCap?.toDouble(), 0, Limits.DAILY_BATCH_CAP_MAX, Limits.DAILY_BATCH_CAP_DEFAULT)
-        val bn = JsonIn.string(r["backfill_networks"])
         return RemoteConfig(
             etag = JsonIn.string(r["etag"]) ?: "",
             ttlS = clampInt(JsonIn.double(r["ttl_s"]), Limits.CONFIG_TTL_S_MIN, Limits.CONFIG_TTL_S_MAX, Limits.CONFIG_TTL_S_DEFAULT),
@@ -63,7 +61,6 @@ internal object ConfigRules {
             ),
             fullDump = JsonIn.bool(r["full_dump"]) ?: false,
             fullDumpTtlS = clampInt(JsonIn.double(r["full_dump_ttl_s"]), 0, FULL_DUMP_TTL_S_MAX, 0),
-            backfillNetworks = if (bn == "unmetered" || bn == "any") bn else "unmetered",
             dailyBatchCap = clampInt(JsonIn.double(r["daily_batch_cap"]), 0, Limits.DAILY_BATCH_CAP_MAX, hostCap),
         )
     }
@@ -94,7 +91,6 @@ internal object ConfigRules {
         o.raw(",\"local_cap_bytes\":"); o.int(c.localCapBytes)
         o.raw(",\"full_dump\":"); o.bool(c.fullDump)
         o.raw(",\"full_dump_ttl_s\":"); o.int(c.fullDumpTtlS)
-        o.raw(",\"backfill_networks\":"); o.string(c.backfillNetworks)
         o.raw(",\"daily_batch_cap\":"); o.int(c.dailyBatchCap)
         o.raw("}")
         return o.toByteArray()

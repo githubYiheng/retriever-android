@@ -23,7 +23,7 @@ internal class ConfigEffect {
 
 /**
  * 选下一批：p0 > p1 > p2，同级 created_ms 升序（失败过的批让到后面，避免头阻塞）；单在途；相邻请求 ≥ 2 s；
- * 全局或对应类别未暂停；backfill 在计量网络上不传（backfill_networks = unmetered）。
+ * 全局或对应类别未暂停。
  */
 internal fun Engine.nextSend(): SendStep {
     val nowMono = clock.monoMs()
@@ -43,15 +43,14 @@ internal fun Engine.nextSend(): SendStep {
     val candidates = metas.values.filter { it.prio < 3 }
     if (candidates.isEmpty()) return SendStep.Stop("empty", null)
     val pausedCats: Set<String> = if (pauseActive) backoff.pausedCategories.toSet() else emptySet()
-    val meteredBlock = effective.config.backfillNetworks == "unmetered" && platform.isExpensiveNetwork()
     val eligible = candidates.filter { m ->
         val c = m.category
-        !(c != null && c in pausedCats) && !(m.kind == Ids.BatchKind.BACKFILL && meteredBlock)
+        !(c != null && c in pausedCats)
     }.sortedWith(
         compareBy<BatchMeta>({ if ((fails[it.name]?.count ?: 0) > 0) 1 else 0 }, { it.prio }, { it.createdMs }, { it.name }),
     )
-    val pick = eligible.firstOrNull()
-        ?: return if (pausedCats.isNotEmpty()) SendStep.Stop("paused", backoff.pausedUntilMono) else SendStep.Stop("metered", null)
+    // candidates 非空时 eligible 为空只可能是类别暂停
+    val pick = eligible.firstOrNull() ?: return SendStep.Stop("paused", backoff.pausedUntilMono)
     if (!acquireUploadLock()) return SendStep.Stop("locked", nowMono + 60_000)
     val body = Fs.read(File(outboxDir, pick.name))
     val inst = install

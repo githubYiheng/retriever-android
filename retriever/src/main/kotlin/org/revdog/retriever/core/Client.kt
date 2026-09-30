@@ -842,7 +842,7 @@ internal class RetrieverClient(
         fun flushReason(stop: String): String = when (stop) {
             "offline" -> "offline"
             "backoff" -> "backoff"
-            "paused", "upload_disabled", "not_configured", "locked", "metered", "disabled" -> "paused"
+            "paused", "upload_disabled", "not_configured", "locked", "disabled" -> "paused"
             else -> "timeout"
         }
 

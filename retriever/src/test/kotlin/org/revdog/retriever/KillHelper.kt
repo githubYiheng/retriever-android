@@ -35,8 +35,6 @@ private object HeadlessPlatform : Platform {
 
     override fun stopObserving(sink: PlatformEventSink) = Unit
 
-    override fun isExpensiveNetwork(): Boolean = false
-
     override fun availableBytes(dir: File): Long? = null
 
     override fun scheduleUploadJob(jobId: Int) = Unit

@@ -13,7 +13,7 @@ import java.io.StringWriter
  * - 级别：VERBOSE / DEBUG → debug、INFO → info、WARN → warn、ERROR → error、ASSERT → fatal；tag = Timber 的 tag。
  * - `isLoggable` 用 `Retriever.localLevel` 早过滤（低于本地级别的行连格式化都不做，也不占 seq）。
  * - Timber 在 message 尾部拼了 `"\n" + 栈`（`prepareLog`）：这里把它剥掉，栈放进 `exc`
- *   （type = 异常类名、message、stack = `Log.getStackTraceString`，由 SDK 生成）。只有异常没有消息时 msg = `t.toString()`。
+ *   （type = 异常类名、message、stack = `printStackTrace` 文本，由 SDK 生成）。只有异常没有消息时 msg = `t.toString()`。
  */
 public class RetrieverTree internal constructor(
     private val emit: (LogLevel, String, String?, Throwable?) -> Unit,

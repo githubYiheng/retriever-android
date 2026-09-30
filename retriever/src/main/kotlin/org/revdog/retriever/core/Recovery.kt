@@ -88,7 +88,11 @@ private fun Engine.recoverOne(
         f.tornSeq?.let { maxSeq = maxOf(maxSeq, it) }
         f.tornOseq?.let { if (it > 0) maxOseq = maxOf(maxOseq, it) }
     }
+    // 旧段已被驱逐时盘上最大值偏低：并入已物化水位（cursor 已与出站箱取过 max）、本会话墓碑与 ctx 游标（驱逐时并入了
+    // 被驱逐段的 lastSeq）。否则合成的 unclean_exit 与已上传序号撞号、永不上传，终态 last_oseq 低报
     maxSeq = maxOf(maxSeq, cursor.ctxThroughSeq)
+    val tombMax = existingDrops.filter { it.sessionId == sid }.maxOfOrNull { it.oseqTo } ?: 0
+    maxOseq = maxOf(maxOseq, cursor.extractedThroughOseq, tombMax)
 
     if (cursor.closedMs == null) {
         // 缺口（残行、全 0 块、未落盘的 write_failed）计 corrupt 墓碑；已有墓碑覆盖的不重复记

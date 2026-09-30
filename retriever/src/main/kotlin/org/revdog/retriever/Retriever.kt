@@ -65,7 +65,7 @@ public object Retriever {
 
     /**
      * 记一行。`msg` 可为 null（Java 常见的 `e.getMessage()`）：有异常时取 `error.toString()`，否则空串——绝不抛给宿主。
-     * `error` → `exc`（type = 类名、message、stack = `Log.getStackTraceString`）。
+     * `error` → `exc`（type = 类名、message、stack = `printStackTrace` 文本）。
      */
     @JvmStatic
     @JvmOverloads

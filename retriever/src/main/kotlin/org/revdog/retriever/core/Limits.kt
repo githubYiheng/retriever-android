@@ -72,6 +72,9 @@ internal object ClientConstants {
     /** §3.7 隔离批 24 h 后再试。 */
     const val QUARANTINE_RETRY_MS = 24L * 60 * 60 * 1000
 
+    /** 调度地板：任何候选已到期时也至少等 1 s，杜绝 0 ms 自旋。 */
+    const val SCHEDULER_MIN_DELAY_MS = 1000L
+
     /** §3.9 传输连接 / 读超时。 */
     const val REQUEST_TIMEOUT_MS = 30_000
 

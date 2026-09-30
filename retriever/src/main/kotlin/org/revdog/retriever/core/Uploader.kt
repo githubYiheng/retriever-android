@@ -23,12 +23,14 @@ internal class ConfigEffect {
 
 /**
  * 选下一批：p0 > p1 > p2，同级 created_ms 升序（失败过的批让到后面，避免头阻塞）；单在途；相邻请求 ≥ 2 s；
- * 全局或对应类别未暂停。
+ * 全局或对应类别未暂停。读不出的批本轮跳过、试下一个（不递归：reconcileOutbox 每轮都会把它载回）。
  */
 internal fun Engine.nextSend(): SendStep {
     val nowMono = clock.monoMs()
     if (key.isEmpty()) return SendStep.Stop("not_configured", null)
     if (!enabled) return SendStep.Stop("disabled", null)
+    // 未 bootstrap（install.json 写不进 / 读不了）：不碰磁盘直接停，bootstrap 成功后由 startup 重新排空
+    val inst = install ?: return SendStep.Stop("not_bootstrapped", null)
     if (!effective.config.uploadEnabled) return SendStep.Stop("upload_disabled", null)
     val pauseActive = backoff.pausedUntilMono > nowMono
     if (pauseActive && "all" in backoff.pausedCategories) return SendStep.Stop("paused", backoff.pausedUntilMono)
@@ -50,29 +52,28 @@ internal fun Engine.nextSend(): SendStep {
         compareBy<BatchMeta>({ if ((fails[it.name]?.count ?: 0) > 0) 1 else 0 }, { it.prio }, { it.createdMs }, { it.name }),
     )
     // candidates 非空时 eligible 为空只可能是类别暂停
-    val pick = eligible.firstOrNull() ?: return SendStep.Stop("paused", backoff.pausedUntilMono)
+    if (eligible.isEmpty()) return SendStep.Stop("paused", backoff.pausedUntilMono)
     if (!acquireUploadLock()) return SendStep.Stop("locked", nowMono + 60_000)
-    val body = Fs.read(File(outboxDir, pick.name))
-    val inst = install
-    if (body == null || inst == null) {
-        metas.remove(pick.name)
-        return nextSend()
+    for (pick in eligible) {
+        // 读不出（坏块 / 权限）：不删、不隔离、不计 fail，留在出站箱下一轮再试，最终由容量驱逐兜底
+        val body = Fs.read(File(outboxDir, pick.name)) ?: continue
+        val req = HttpRequest(
+            "POST", endpoint("v1/batches"),
+            linkedMapOf(
+                "Authorization" to "Bearer $key",
+                "Content-Type" to "application/json",
+                "Content-Encoding" to "gzip",
+                "X-Rtv-Install" to inst.installId,
+                "X-Rtv-Sent-Ms" to clock.wallMs().toString(),
+                "X-Rtv-Sdk" to sdkHeader,
+            ),
+            body,
+        )
+        inFlight = pick.name
+        lastRequestMono = nowMono
+        return SendStep.Send(pick.name, req)
     }
-    val req = HttpRequest(
-        "POST", endpoint("v1/batches"),
-        linkedMapOf(
-            "Authorization" to "Bearer $key",
-            "Content-Type" to "application/json",
-            "Content-Encoding" to "gzip",
-            "X-Rtv-Install" to inst.installId,
-            "X-Rtv-Sent-Ms" to clock.wallMs().toString(),
-            "X-Rtv-Sdk" to sdkHeader,
-        ),
-        body,
-    )
-    inFlight = pick.name
-    lastRequestMono = nowMono
-    return SendStep.Send(pick.name, req)
+    return SendStep.Stop("unreadable", null)
 }
 
 // MARK: 上传锁（多进程：只有拿到 upload.lock 的一方排空；每轮排空结束释放）
@@ -106,7 +107,9 @@ internal fun Engine.handleResponse(name: String, response: HttpResponse?): Respo
                 failure(name, null, "echo_mismatch", true)
             }
         }
-        401, 403 -> authPause()
+        // 只有服务端明确表态（JSON 对象且 reason 是字符串，未知值也算）才鉴权暂停；边缘 / WAF / captive portal
+        // 替服务端回的 401 / 403（HTML、空体、无 reason）按「其它」退避并计 fail（ADR 0011）
+        401, 403 -> if (body?.get("reason") is String) authPause() else failure(name, null, "http_${response.status}", true)
         413 -> split413(name)
         429 -> categoryPause(body, response.headers["retry-after"])
         503 -> failure(name, retryAfter(body, response.headers["retry-after"]), "http_503", false)
@@ -172,7 +175,14 @@ private fun Engine.ack(meta: BatchMeta) {
     backoff.nextAtMonoMs = 0
     backoff.nextAtWallMs = 0
     backoff.lastAckMs = nowWall
-    if ("all" !in backoff.pausedCategories) backoff.reason = ""
+    // 任何一次 2xx 都复位暂停倍增状态（否则几个月前的一次 401 会让下次直接从更长时长起步）；已到期的暂停一并清掉，
+    // 仍在生效的类别暂停（429 info / backfill）不动（ADR 0011）
+    backoff.reason = ""
+    if (backoff.pausedUntilMono <= clock.monoMs()) {
+        backoff.pausedCategories = emptyList()
+        backoff.pausedUntilMono = 0
+        backoff.pausedUntilMs = 0
+    }
     persistBackoff()
 }
 
@@ -194,7 +204,7 @@ private fun Engine.failure(name: String, retryAfterS: Int?, reason: String, coun
     if (f.count >= Limits.POISON_CONSECUTIVE_FAILS && f.otherSuccess) quarantine(name)
 }
 
-/** 401 / 403：全局暂停 1 h 起倍增到 24 h；照常写本地、照常拉配置；不删任何文件。 */
+/** 401 / 403 带 reason：全局暂停 1 h 起倍增到 24 h；照常写本地、照常拉配置；不删任何文件。 */
 private fun Engine.authPause() {
     val prev: Long? = if (backoff.reason.startsWith("auth:")) backoff.reason.substring(5).toLongOrNull() else null
     val dur = if (prev != null) minOf(prev * 2, Limits.PAUSE_401_MAX_MS) else Limits.PAUSE_401_BASE_MS
@@ -248,6 +258,8 @@ internal fun Engine.configRequest(): HttpRequest? {
     )
     // 值一律 percent-encode（ASCII 字母数字以外全部编码，服务端 decodeURIComponent）
     writer.currentUser?.let { h["X-Rtv-User"] = percentEncode(it) }
+    // 发起即记「上次尝试时刻」：请求在途期间轮询候选不再是过去时（否则调度器以 0 ms 自旋到响应回来）
+    lastConfigFetchMono = clock.monoMs()
     return HttpRequest("GET", endpoint("v1/config"), h, null)
 }
 

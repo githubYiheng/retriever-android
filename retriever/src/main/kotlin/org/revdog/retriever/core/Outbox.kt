@@ -220,8 +220,9 @@ internal fun Engine.split413(name: String) {
 private class EvSeg(val file: File, val size: Long, val mtime: Long, val segNo: Int)
 
 /**
- * 总量 = 各会话段 + 出站箱；上限 = min(local_cap_bytes, 本方已占 + 可用空间 − 64 MB 余量)。
- * 顺序：RETAINED 段最旧优先（无义务不记墓碑；> 7 d 无条件删）→ p2（backfill_evicted）→ q（quarantine_evicted）
+ * 总量 = 各会话段 + 出站箱；两个额度（ADR 0010）：硬上限 = local_cap_bytes，是驱逐义务批的唯一依据；
+ * 余量额度 = min(硬上限, 本方已占 + 可用空间 − 64 MB)（可用空间未知时 = 硬上限），只约束无义务类（RETAINED 段、p2）。
+ * 顺序：RETAINED 段最旧优先（无义务不记墓碑；> 7 d 无条件删）→ p2（backfill_evicted）→（超硬上限时）q（quarantine_evicted）
  * → p1（buffer_overflow）→ p0（buffer_overflow）。当前 OPEN 段永不驱逐。
  */
 internal fun Engine.evictIfNeeded() {
@@ -246,9 +247,10 @@ internal fun Engine.evictIfNeeded() {
     reconcileOutbox()
     for (m in metas.values) total += m.bytes
 
-    var cap = effective.config.localCapBytes.toLong()
+    val hardCap = effective.config.localCapBytes.toLong()
     val avail = platform.availableBytes(root)
-    if (avail != null) cap = minOf(cap, maxOf(0, total + avail - ClientConstants.DISK_RESERVE_BYTES))
+    // 低磁盘只让出可再生的部分：义务批不能因余量不足在上传前消失（否则墓碑也永远送不出去）
+    val softCap = if (avail != null) minOf(hardCap, maxOf(0, total + avail - ClientConstants.DISK_RESERVE_BYTES)) else hardCap
     sealed.sortWith(compareBy<EvSeg>({ it.mtime }, { it.segNo }))
     val tombs = ArrayList<DropEntry>()
     val maxAge = Limits.RING_MAX_AGE_DAYS * ClientConstants.DAY_MS
@@ -262,7 +264,7 @@ internal fun Engine.evictIfNeeded() {
         }
     }
     val cur = current
-    if (total > cap && cur != null && (cur.sealed.lastOrNull()?.lastOseq ?: 0) > cur.cursor.extractedThroughOseq) {
+    if (total > softCap && cur != null && (cur.sealed.lastOrNull()?.lastOseq ?: 0) > cur.cursor.extractedThroughOseq) {
         // daily cap 推迟的义务行先物化，保证 RETAINED 段不带义务
         materialize(cur, cur.sealed.maxOfOrNull { it.lastOseq } ?: 0, cur.sealed.lastOrNull()?.lastSeq ?: 0, false, true)
         reconcileOutbox()
@@ -270,12 +272,14 @@ internal fun Engine.evictIfNeeded() {
             (writer.currentSegmentFile?.let { Fs.size(it) } ?: 0)
     }
     for (s in remaining) {
-        if (total <= cap) break
+        if (total <= softCap) break
         total -= s.size
         evictSegment(s.file, nowWall, tombs)
     }
-    if (total > cap) {
+    if (total > softCap) {
         for (prio in intArrayOf(2, 3, 1, 0)) {
+            // p2 无义务，受余量额度约束；q / p1 / p0 只受硬上限约束
+            val cap = if (prio == 2) softCap else hardCap
             val batch = metas.values.filter { it.prio == prio && it.name != inFlight }
                 .sortedWith(compareBy<BatchMeta>({ it.createdMs }, { it.name }))
             for (m in batch) {
@@ -307,6 +311,12 @@ private fun Engine.evictSegment(file: File, now: Long, tombs: MutableList<DropEn
             others.remove(s.meta.sessionId)
             Fs.remove(s.dir)
             return
+        }
+        // seq 高水位：被驱逐段的行不可能再作 ctx，把它的 lastSeq 并入 ctx 游标语义正确，又不改磁盘格式；
+        // 恢复时 maxSeq 取 max(盘上, ctx_through_seq)，旧段全被驱逐后合成行的 seq 也不会回退撞号
+        if (info.lastSeq > s.cursor.ctxThroughSeq) {
+            s.cursor.ctxThroughSeq = info.lastSeq
+            writeCursor(s)
         }
         break
     }

@@ -153,7 +153,7 @@ package org.revdog.retriever {
 
   public final class RetrieverVersion {
     property public static String CURRENT;
-    field public static final String CURRENT = "0.1.1";
+    field public static final String CURRENT = "0.1.2";
     field public static final org.revdog.retriever.RetrieverVersion INSTANCE;
   }
 

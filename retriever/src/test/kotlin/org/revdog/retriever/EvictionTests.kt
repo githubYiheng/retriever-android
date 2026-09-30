@@ -11,6 +11,7 @@ import org.revdog.retriever.core.Fs
 import org.revdog.retriever.core.Ids
 import org.revdog.retriever.core.Jsonl
 import org.revdog.retriever.core.Limits
+import org.revdog.retriever.core.SealReason
 import org.revdog.retriever.core.evictIfNeeded
 import org.revdog.retriever.core.materializeBackfill
 import org.revdog.retriever.core.quarantine
@@ -95,6 +96,52 @@ class EvictionTests : RtvTest() {
         val results = runValidator(listOf(env))
         assertAllValid(results)
         assertEquals(4L, int(obj(results[0]["stats"])["dropsN"]))
+    }
+
+    /** ADR 0010：可用空间 10 MB（余量额度算成 0）时刚物化的 error 批留在出站箱并被上传，RETAINED 段让出。 */
+    @Test
+    fun lowDiskKeepsFreshObligationBatchAndUploadsIt() {
+        val h = Harness()
+        h.settle()
+        h.platform.available = 10L * 1024 * 1024
+        h.l(LogLevel.DEBUG, "context")
+        h.l(LogLevel.ERROR, "boom")
+        h.seal(SealReason.ERROR)
+        assertEquals("义务批不因磁盘余量被驱逐", 1, h.outboxFiles("p0").size)
+        assertEquals("RETAINED 段被驱逐", emptyList<String>(), (h.sessionDir().list() ?: emptyArray()).filter { it.endsWith(".sealed") })
+        assertTrue(h.client.debugOpenSegmentFile!!.exists())
+        assertEquals(0, h.readJsonl("drops.jsonl").size)
+        h.tick(2000)
+        assertEquals(1, h.transport.batchRequests.size)
+        assertEquals(listOf("context", "boom"), FakeTransport.envOf(h.transport.batchRequests[0].body)!!.lines.map { it["msg"] })
+        assertEquals(emptyList<String>(), h.outboxFiles())
+    }
+
+    /** ADR 0010：低磁盘只驱逐 RETAINED 段与 p2（记 backfill_evicted）；超过 local_cap_bytes 时仍按 q → p1 → p0 驱逐并记墓碑。 */
+    @Test
+    fun lowDiskEvictsOnlyNonObligationUntilHardCap() {
+        val h = prepare()
+        val dir = h.sessionDir()
+        fun sealedSegs() = (dir.list() ?: emptyArray()).filter { it.endsWith(".sealed") }.sorted()
+        assertEquals(6, sealedSegs().size)
+        h.platform.available = 10L * 1024 * 1024
+        h.work { it.evictIfNeeded() }
+        assertEquals(emptyList<String>(), sealedSegs())
+        assertEquals(listOf("p0", "p1", "q-"), h.outboxFiles().map { it.take(2) }.sorted())
+        assertEquals(listOf("backfill_evicted"), h.readJsonl("drops.jsonl").map { it["reason"] })
+        // 再次驱逐（磁盘仍紧张）：义务批与隔离批不动
+        h.work { it.evictIfNeeded() }
+        assertEquals(listOf("p0", "p1", "q-"), h.outboxFiles().map { it.take(2) }.sorted())
+        // 硬上限压到 0：q → p1 → p0 依次驱逐，当前 OPEN 段永不驱逐
+        h.work { e ->
+            e.effective.config = e.effective.config.copy(localCapBytes = 0)
+            e.evictIfNeeded()
+        }
+        assertEquals(emptyList<String>(), h.outboxFiles())
+        assertTrue(h.client.debugOpenSegmentFile!!.exists())
+        val drops = h.readJsonl("drops.jsonl")
+        assertEquals(listOf("backfill_evicted", "quarantine_evicted", "buffer_overflow", "buffer_overflow"), drops.map { it["reason"] })
+        assertEquals(listOf(0L, 1L, 2L, 3L), drops.map { int(it["oseq_from"]) })
     }
 
     @Test

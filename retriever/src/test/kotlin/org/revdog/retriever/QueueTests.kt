@@ -107,7 +107,7 @@ class QueueTests : RtvTest() {
                 e.backoff.pausedUntilMono = 0
                 e.backoff.pausedCategories = emptyList()
             }
-            h.transport.setScript(listOf(Reply.Status(401)))
+            h.transport.setScript(listOf(Reply.Status(401, mapOf("reason" to "key_invalid"))))
             h.tick(Limits.MIN_REQUEST_SPACING_MS)
         }
         b = h.backoff

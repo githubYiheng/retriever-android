@@ -1,5 +1,7 @@
 package org.revdog.retriever.core
 
+import org.revdog.retriever.LogLevel
+import org.revdog.retriever.LogLine
 import org.revdog.retriever.Options
 import java.io.File
 import java.io.FileOutputStream
@@ -58,6 +60,8 @@ internal class Engine(
 
     var configCache: ConfigCache? = null
     var effective: EffectiveConfig
+
+    /** 上次尝试拉配置的单调时刻（构造请求时记一次、响应回来再记一次；null = 本进程还没拉过）。 */
     var lastConfigFetchMono: Long? = null
 
     var backoff = BackoffState()
@@ -107,17 +111,20 @@ internal class Engine(
 
     // MARK: 启动（同步：log() 在构造返回后立即可用）
 
-    /** 建目录、install.json（首次生成 createNewFile 临时文件 → sync → rename，失败方重读）、计数器 +1、新会话。 */
+    /**
+     * 建目录、install.json（首次生成 createNewFile 临时文件 → sync → rename，失败方重读；读到但解析不了 = 损坏，
+     * 同一把锁内原子重建并留痕）、计数器 +1、新会话。
+     */
     fun bootstrap(): Boolean {
         if (!Fs.ensureDir(root) || !Fs.ensureDir(procDir) || !Fs.ensureDir(outboxDir)) return false
         val result = locks.withDirLock { bumpInstallLocked() } ?: return false
-        val inst = result.first
+        val inst = result.info
         install = inst
         val now = clock.wallMs()
         val sid = Ids.newV4()
         val dir = File(procDir, sid)
         if (!Fs.ensureDir(dir)) return false
-        val meta = SessionMeta(sid, result.second, now, device, processName)
+        val meta = SessionMeta(sid, result.sessionNo, now, device, processName)
         Fs.writeAtomic(File(dir, "meta.json"), meta.encode())
         lockSessionDir(dir)
         val fg = platform.isForeground()
@@ -127,6 +134,14 @@ internal class Engine(
         writeCursor(rec)
         writer.startSession(dir, sid)
         loadPersistentState()
+        if (result.reset) {
+            // install_id 换了、session_no 从 1 重来：留一条合成行，服务端据此解释这台设备的断档（同 rtv.flush 合成行的写法）
+            val enc = LineEncoder.encode(
+                LogLine(now, LogLevel.WARN, "install.json unreadable; install_id regenerated", "rtv.install_reset", null, null),
+                synthetic = true,
+            )
+            writer.append(LogLevel.WARN, enc.body)
+        }
         return true
     }
 
@@ -140,14 +155,39 @@ internal class Engine(
         sessionLock = null
     }
 
-    private fun bumpInstallLocked(): Pair<InstallInfo, Long>? {
-        val inst: InstallInfo = Fs.read(installFile)?.let { InstallInfo.decode(it) } ?: (createInstallLocked() ?: return null)
+    private class Bumped(val info: InstallInfo, val sessionNo: Long, val reset: Boolean)
+
+    /**
+     * 区分「读不到」与「读到了但解析不了」：不存在 → 首次创建；存在但读失败（权限 / directBoot 下 CE 不可读 / I/O）→
+     * 本次失败、稍后重试，**绝不重建**（否则一次瞬时读错就换掉 install_id）；读到字节（含 0 字节）却解析不了 → 损坏，重建。
+     */
+    private fun bumpInstallLocked(): Bumped? {
+        var reset = false
+        val inst: InstallInfo = if (!installFile.exists()) {
+            createInstallLocked(false) ?: return null
+        } else {
+            val bytes = readInstallBytes() ?: return null
+            InstallInfo.decode(bytes) ?: run {
+                reset = true
+                createInstallLocked(true) ?: return null
+            }
+        }
         inst.sessionCounter += 1
         if (!Fs.writeAtomic(installFile, inst.encode())) return null
-        return Pair(inst, inst.sessionCounter)
+        return Bumped(inst, inst.sessionCounter, reset)
     }
 
-    private fun createInstallLocked(): InstallInfo? {
+    /** null = 读失败（与「不存在」「读到 0 字节」区分开）。 */
+    private fun readInstallBytes(): ByteArray? = try {
+        installFile.readBytes()
+    } catch (e: IOException) {
+        null
+    } catch (e: SecurityException) {
+        null
+    }
+
+    /** `replaceCorrupt`：原文件已损坏，同一套 tmp → sync → rename 原子替换它（新 install_id、计数器从 0 起）。 */
+    private fun createInstallLocked(replaceCorrupt: Boolean): InstallInfo? {
         val info = InstallInfo(Ids.newV4(), 0, clock.wallMs())
         val tmp = File(root, ".install.json.tmp-${Ids.newV4()}")
         try {
@@ -156,12 +196,12 @@ internal class Engine(
                     out.write(info.encode())
                     out.fd.sync()
                 }
-                if (installFile.exists() || !tmp.renameTo(installFile)) tmp.delete()
+                if ((!replaceCorrupt && installFile.exists()) || !tmp.renameTo(installFile)) tmp.delete()
             }
         } catch (e: IOException) {
             tmp.delete()
         }
-        // 失败方（或并发的另一方已写）重读
+        // 失败方（或并发的另一方已写）重读；重建失败时重读到的仍是坏文件 → null，本次 bootstrap 失败
         return Fs.read(installFile)?.let { InstallInfo.decode(it) }
     }
 

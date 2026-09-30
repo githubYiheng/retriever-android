@@ -16,6 +16,7 @@ import org.revdog.retriever.core.PlatformEventSink
 import org.revdog.retriever.core.RetrieverClient
 import org.revdog.retriever.core.SealReason
 import org.revdog.retriever.core.Transport
+import org.revdog.retriever.core.stackTraceText
 import java.io.File
 import java.io.PrintWriter
 import java.io.StringWriter
@@ -128,8 +129,14 @@ internal class FakeClock(wall: Long = 1_790_668_800_000L, mono: Long = 1_000_000
         advance(maxOf(ms, 0))
     }
 
+    /** 调度器请求过的定时延迟（断言「不以 0 ms 自旋」用；不真的调度）。 */
+    val timerDelays = CopyOnWriteArrayList<Long>()
+
     /** 调度器不自动唤醒（测试手动 tick）。 */
-    override fun timerDelayMs(ms: Long): Long? = null
+    override fun timerDelayMs(ms: Long): Long? {
+        timerDelays.add(ms)
+        return null
+    }
 }
 
 /** 真实时钟（真杀进程子进程用）：单调时钟用 System.nanoTime()。 */
@@ -157,6 +164,9 @@ internal class FakeTransport : Transport {
 
         class Status(val code: Int, val body: Map<String, Any?>? = null, val headers: Map<String, String> = emptyMap()) : Reply()
 
+        /** 任意字节的响应体（HTML 错误页等非 JSON） */
+        class Raw(val code: Int, val body: ByteArray) : Reply()
+
         /** 网络错误 */
         object Network : Reply()
 
@@ -179,6 +189,10 @@ internal class FakeTransport : Transport {
 
     @Volatile
     var configEtag = "etag-0"
+
+    /** 非 null 时配置请求挂在这里直到放行（模拟「拉配置在途」）。 */
+    @Volatile
+    var configGate: CountDownLatch? = null
     private val requests = ArrayList<HttpRequest>()
     private val hanging = ArrayList<CountDownLatch>()
 
@@ -216,6 +230,7 @@ internal class FakeTransport : Transport {
         }
         val rep = reply
         if (rep == null) {
+            configGate?.await(30, TimeUnit.SECONDS)
             val c = cfg ?: return HttpResponse(404)
             return HttpResponse(200, emptyMap(), toJson(c).toByteArray())
         }
@@ -226,6 +241,7 @@ internal class FakeTransport : Transport {
                 toJson(mapOf("batch_id" to "00000000-0000-4000-8000-000000000000", "status" to "stored", "config_etag" to etag)).toByteArray(),
             )
             is Reply.Status -> HttpResponse(rep.code, rep.headers, rep.body?.let { toJson(it).toByteArray() } ?: ByteArray(0))
+            is Reply.Raw -> HttpResponse(rep.code, emptyMap(), rep.body)
             Reply.Network -> null
             Reply.Hang -> {
                 val latch = CountDownLatch(1)
@@ -287,11 +303,8 @@ internal class FakePlatform : Platform {
         scheduledJobs.add(jobId)
     }
 
-    override fun stackTraceString(t: Throwable): String {
-        val sw = StringWriter()
-        t.printStackTrace(PrintWriter(sw))
-        return sw.toString()
-    }
+    /** 与 AndroidPlatform 同一个实现（纯 JVM）。 */
+    override fun stackTraceString(t: Throwable): String = stackTraceText(t)
 
     override fun allowDiskWrites(): Any? {
         diskAllowances.incrementAndGet()

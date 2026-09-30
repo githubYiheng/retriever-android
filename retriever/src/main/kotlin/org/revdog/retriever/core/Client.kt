@@ -682,7 +682,7 @@ internal class RetrieverClient(
             timer = null
             timerTarget = next
             if (next == null) return
-            val delay = clock.timerDelayMs(maxOf(0, next - nowMono)) ?: return
+            val delay = clock.timerDelayMs(schedulerDelayMs(next, nowMono)) ?: return
             timer = work.schedule({ guard { tick() } }, delay, TimeUnit.MILLISECONDS)
         }
     }
@@ -838,6 +838,9 @@ internal class RetrieverClient(
             val out = Text.truncate(sb.toString(), Limits.PROCESS_BYTES).s
             return out.ifEmpty { "main" }
         }
+
+        /** 定时器延迟 = max(next − now, 1 s)：候选已到期（如请求在途时的过去时刻）也不以 0 ms 自旋。 */
+        fun schedulerDelayMs(next: Long, nowMono: Long): Long = maxOf(next - nowMono, ClientConstants.SCHEDULER_MIN_DELAY_MS)
 
         fun flushReason(stop: String): String = when (stop) {
             "offline" -> "offline"

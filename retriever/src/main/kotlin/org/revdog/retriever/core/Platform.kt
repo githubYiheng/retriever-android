@@ -4,6 +4,8 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.io.PrintWriter
+import java.io.StringWriter
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Collections
@@ -65,13 +67,30 @@ internal interface Platform {
     /** 排一个一次性后台上传作业（JobScheduler：网络约束、持久化）。已有同 id 作业在排 / 在跑则不动。 */
     fun scheduleUploadJob(jobId: Int)
 
-    /** Throwable → 栈文本（Android：`Log.getStackTraceString`）。 */
+    /** Throwable → 栈文本（Android：[stackTraceText]）。 */
     fun stackTraceString(t: Throwable): String
 
     /** 写入处放行磁盘 I/O（Android：`StrictMode.allowThreadDiskWrites()`），返回旧策略令牌。 */
     fun allowDiskWrites(): Any?
 
     fun restoreDiskPolicy(token: Any?)
+}
+
+/**
+ * 栈文本 = `StringWriter` + `printStackTrace`（JDK 自带环检测，成环处输出 `[CIRCULAR REFERENCE: …]` 后正常结束）。
+ * 不用 `Log.getStackTraceString`：cause 链含 UnknownHostException 时它返回空串（网络错误恰恰丢栈），cause 成环时死循环。
+ * 取栈本身失败（宿主异常的 toString / printStackTrace 抛出、cause 链极深导致 StackOverflowError）返回空串，绝不抛给宿主。
+ */
+internal fun stackTraceText(t: Throwable): String = try {
+    val sw = StringWriter(256)
+    val pw = PrintWriter(sw, false)
+    t.printStackTrace(pw)
+    pw.flush()
+    sw.toString()
+} catch (e: Exception) {
+    ""
+} catch (e: StackOverflowError) {
+    ""
 }
 
 /**

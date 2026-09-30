@@ -15,12 +15,12 @@ import android.os.Bundle
 import android.os.StrictMode
 import android.os.storage.StorageManager
 import android.os.SystemClock
-import android.util.Log
 import org.revdog.retriever.RetrieverUploadJobService
 import org.revdog.retriever.core.Clock
 import org.revdog.retriever.core.Platform
 import org.revdog.retriever.core.PlatformEvent
 import org.revdog.retriever.core.PlatformEventSink
+import org.revdog.retriever.core.stackTraceText
 import java.io.File
 import java.io.IOException
 import java.util.Locale
@@ -43,7 +43,7 @@ internal object AndroidClock : Clock {
  * - 生命周期：`registerActivityLifecycleCallbacks` 计数 started activities → 前台 / 后台（配置变更重建不算）；
  * - 网络：`registerDefaultNetworkCallback` 的 onAvailable 只用来提前唤醒（不做可达性预检）；
  * - 后台兜底：框架 JobScheduler 一次性作业（网络约束、持久化；ADR 0003 决定 13，不引 WorkManager）；
- * - StrictMode：写入处 `allowThreadDiskWrites()` 包住并恢复；栈：`Log.getStackTraceString`。
+ * - StrictMode：写入处 `allowThreadDiskWrites()` 包住并恢复；栈：`printStackTrace` 文本（[stackTraceText]，不用 `Log.getStackTraceString`）。
  */
 internal class AndroidPlatform(private val app: Context) : Platform {
     @Volatile
@@ -233,7 +233,7 @@ internal class AndroidPlatform(private val app: Context) : Platform {
         }
     }
 
-    override fun stackTraceString(t: Throwable): String = Log.getStackTraceString(t)
+    override fun stackTraceString(t: Throwable): String = stackTraceText(t)
 
     override fun allowDiskWrites(): Any? = StrictMode.allowThreadDiskWrites()
 

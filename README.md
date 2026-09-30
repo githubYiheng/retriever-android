@@ -5,8 +5,8 @@ Kotlin，minSdk 24 / compileSdk 36，JVM 17。规格：`docs/plan/system-design.
 
 | 模块 | 坐标 | 依赖 | 用途 |
 |---|---|---|---|
-| `retriever` | `org.revdog:retriever:0.1.1` | **只有 kotlin-stdlib**（无 AndroidX、无 coroutines、无 okhttp） | 传输层本体 + `RetrieverLog`（`android.util.Log` 替身） |
-| `retriever-timber` | `org.revdog:retriever-timber:0.1.1` | `:retriever` + `com.jakewharton.timber:timber:5.0.1` | `RetrieverTree` |
+| `retriever` | `org.revdog:retriever:0.1.2` | **只有 kotlin-stdlib**（无 AndroidX、无 coroutines、无 okhttp） | 传输层本体 + `RetrieverLog`（`android.util.Log` 替身） |
+| `retriever-timber` | `org.revdog:retriever-timber:0.1.2` | `:retriever` + `com.jakewharton.timber:timber:5.0.1` | `RetrieverTree` |
 
 产物 Kotlin 语言版本 2.0（POM 里的 kotlin-stdlib = 2.0.21），宿主 Kotlin ≥ 2.0 即可。发布渠道：自托管 Maven 仓库 `https://maven.revdog.org/releases`（ADR 0006，与 revenue-dog 共用）+ 公开只读源码镜像 `githubYiheng/retriever-android`；门禁与发布脚本见文末「发布」。
 
@@ -46,7 +46,7 @@ Java：`Retriever.configure(ctx, key)`、`Retriever.log(LogLevel.ERROR, "msg", "
 - **不挂崩溃处理器**：未捕获异常由下次启动的恢复流程发现（前台死亡 → 合成 `rtv.unclean_exit` 带上下文补传）。
   宿主自有处理器可在其中调 `Retriever.log(LogLevel.FATAL, …, error = t)`（同步物化 + 排作业）。
 - **网络**：SDK 用自己的 `HttpURLConnection`（不经宿主 OkHttp / 拦截器），不缓存、超时 30 s、不跟随重定向；
-  不做可达性预检（`registerDefaultNetworkCallback` 只用来提前唤醒）；full_dump 的 backfill 默认只走非计量网络。
+  不做可达性预检（`registerDefaultNetworkCallback` 只用来提前唤醒）；任何上传（含 full_dump 的 backfill）都不看网络类型（ADR 0009）。
 - **gzip**：请求体是单成员标准 gzip（`GZIPOutputStream`），无尾随字节；文件字节即请求体，重试原样重发。
 - **R8**：aar 自带 consumer 规则（公开 API、JobService、init provider），宿主不用抄规则。
 
@@ -69,7 +69,7 @@ Timber.tag("billing").e(e, "purchase failed %s", sku)
 
 级别 VERBOSE / DEBUG → debug、INFO → info、WARN → warn、ERROR → error、ASSERT → fatal；tag = Timber 的 tag；
 `isLoggable` 用 `Retriever.localLevel` 早过滤（低于本地级别的行连格式化都不做）；Timber 拼在 message 尾部的栈被剥掉，
-异常进 `exc`（type = 类名、stack = `Log.getStackTraceString`）；只有异常没有消息时 msg = `t.toString()`。
+异常进 `exc`（type = 类名、stack = `printStackTrace` 文本）；只有异常没有消息时 msg = `t.toString()`。
 
 ## 示例 app（`example/`）
 
@@ -153,8 +153,8 @@ scripts/sdk-android-maven-publish.sh 0.1.0 --apply  # wrangler 传 R2 `revdog-ma
 // settings.gradle.kts → dependencyResolutionManagement.repositories
 maven { url = uri("https://maven.revdog.org/releases"); content { includeGroup("org.revdog") } }
 // 模块
-implementation("org.revdog:retriever:0.1.1")
-implementation("org.revdog:retriever-timber:0.1.1")   // 可选，宿主已用 Timber 时
+implementation("org.revdog:retriever:0.1.2")
+implementation("org.revdog:retriever-timber:0.1.2")   // 可选，宿主已用 Timber 时
 ```
 
 升级规则：修订号 = 只修 bug；次版本 = 公开 API 只增；主版本 = 公开 API 有减或改，看 CHANGELOG 迁移说明。

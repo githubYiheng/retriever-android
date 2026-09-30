@@ -23,7 +23,7 @@ public enum class LogLevel {
     }
 }
 
-/** 异常（§3.1 `exc`）。Throwable 由 SDK 转换：type = `javaClass.name`、message = `message ?: ""`、stack = `Log.getStackTraceString(t)`。 */
+/** 异常（§3.1 `exc`）。Throwable 由 SDK 转换：type = `javaClass.name`、message = `message ?: ""`、stack = `printStackTrace` 文本（取栈失败为 null）。 */
 public data class LogException(
     val type: String,
     val message: String,
@@ -88,5 +88,5 @@ public fun interface FlushCallback {
 
 /** SDK 版本号（唯一来源）：进 `device.sdk = "retriever-android/<ver>"` 与 `X-Rtv-Sdk`；必须 == gradle.properties 的 VERSION_NAME。 */
 public object RetrieverVersion {
-    public const val CURRENT: String = "0.1.1"
+    public const val CURRENT: String = "0.1.2"
 }

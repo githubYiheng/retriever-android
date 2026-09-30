@@ -5,7 +5,7 @@ import android.util.Log
 /**
  * `android.util.Log` 的同名替身：双写 logcat 与 Retriever。宿主只把 `Log.` 换成 `RetrieverLog.`，调用处不改。
  * 级别：v / d → debug、i → info、w → warn、e → error、wtf → fatal；tag 原样作 Retriever 的 tag；
- * Throwable 进 `exc`（type = 类名、message、stack = `Log.getStackTraceString`）。返回值同 `Log`（写入 logcat 的字节数）。
+ * Throwable 进 `exc`（type = 类名、message、stack = `printStackTrace` 文本）。返回值同 `Log`（写入 logcat 的字节数）。
  */
 public object RetrieverLog {
     /** 测试注入点：logcat 与 Retriever 两个落点。 */

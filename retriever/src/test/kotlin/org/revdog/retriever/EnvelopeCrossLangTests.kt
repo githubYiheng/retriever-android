@@ -73,17 +73,26 @@ class EnvelopeCrossLangTests : RtvTest() {
             b.client.log(LogLevel.WARN, "b warn", null, null, null)
             b.seal()
             val envs = b.envelopes()
-            val rec = envs.first { it["session_id"] == aSid }
-            assertEquals("unclean_fg", objs(rec["closed_sessions"]).first()["exit"])
-            assertEquals(1, objs(rec["drops"]).size)
+            // 墓碑 7..9 高于盘上最大 oseq 1：恢复按墓碑续编（发版前审查 A5），2..6 记 corrupt，
+            // 合成行 oseq = 10 与 1 不相接 → 两批：oseq 1 的批带 drops / closed_sessions，合成行单独成 p0
+            val recs = envs.filter { it["session_id"] == aSid }
+            assertEquals(2, recs.size)
+            val rec = recs.single { it.map.containsKey("closed_sessions") }
+            val closedA = objs(rec["closed_sessions"]).first()
+            assertEquals("unclean_fg", closedA["exit"])
+            assertEquals(10L, int(closedA["last_oseq"]))
+            assertEquals(listOf("buffer_overflow" to 7L, "corrupt" to 2L), objs(rec["drops"]).map { it["reason"] to int(it["oseq_from"]) })
             assertNull("旧会话批不带 mapping", rec["mapping"])
-            assertTrue(rec.lines.any { it["synthetic"] == true })
+            val synth = recs.single { it !== rec }
+            assertTrue(synth.lines.any { it["synthetic"] == true && int(it["oseq"]) == 10L })
+            assertNull(synth["mapping"])
             val cur = envs.first { it["session_id"] != aSid }
             assertEquals("u_1024", obj(cur["mapping"])["user_id"])
             assertEquals("u_1024", cur["user_id"])
             assertEquals("android", obj(cur["device"])["os"])
             assertEquals("retriever-android/${RetrieverVersion.CURRENT}", obj(cur["device"])["sdk"])
             cases.add(expect("recovered_with_drops_closed", rec))
+            cases.add(expect("recovered_unclean_exit", synth))
             cases.add(expect("with_mapping", cur))
         }
 

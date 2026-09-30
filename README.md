@@ -158,3 +158,7 @@ implementation("org.revdog:retriever-timber:0.1.1")   // 可选，宿主已用 T
 ```
 
 升级规则：修订号 = 只修 bug；次版本 = 公开 API 只增；主版本 = 公开 API 有减或改，看 CHANGELOG 迁移说明。
+
+## 脱敏（宿主建议）
+
+日志在落盘前经过 `Options.redact: (LogLine) -> LogLine?`（返回 null = 丢弃该行）。宿主自己的 URL、交易号、用户标识往往会出现在第三方 SDK 的错误文本里，建议在这里统一掩码，例如把 `/v1/subscribers/<id>` 与 `tx=<id>` 替换成 `<masked>`。Retriever 服务端不做二次脱敏，落盘的就是上传的。

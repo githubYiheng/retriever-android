@@ -47,6 +47,10 @@ configure 顺序与宿主误用加固批（ADR 0022「配置响应标明取自�
 - `setUser` 清洗后为空（`""`、纯空白、纯控制字符）= null。SDK 自己取消的请求（purge、后台作业被停）不计入毒批失败次数。
 
 ### 新增
+- **配置诊断（ADR 0025）**：key / baseUrl 写错时在 logcat（tag `Retriever`）说出来——`no_key`、`key_trimmed`、`key_malformed`、`key_env_mismatch`、
+  `base_url_invalid`（`configure` 时本地检查），`key_rejected`（服务端 401 / 403 带 `reason`、进入上传暂停时）；同一（code, key, baseUrl）每进程一次，
+  消息不含 key。只出诊断、不拦请求、不停写本地，不加公开 API。唯一的行为变化：`configure` 先去掉 key 与 baseUrl 首尾的空白与控制字符。
+  过滤：`adb logcat -s Retriever`（README「接错 key / 地址时怎么看」）。
 - 合成行 `rtv.pre_init_dropped`、`rtv.root_vanished`、`rtv.reconfigure_ignored`。
 - `Options.setUploadLevel(LogLevel?)` / `setLocalLevel(LogLevel?)` / `setSdkVersion(String?)`（Java 侧 setter 接受 null；Kotlin 照常用属性赋值）。
 - 示例 app 场景 `preconfigure`、`preconfigure_kill`、`late_configure`（两步：先记一次性标记退出进程，再冷启动跑）。

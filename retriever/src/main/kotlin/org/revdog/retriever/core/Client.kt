@@ -80,6 +80,10 @@ internal class RetrieverClient(
     @Volatile
     var onInternalError: ((Throwable) -> Unit)? = null
 
+    /** 服务端拒绝当前 key、进入鉴权暂停时的诊断出口（静态入口接到系统日志，ADR 0025）。在排空线程上、不持任何 SDK 锁时调。 */
+    @Volatile
+    var onKeyRejected: ((KeyRejection) -> Unit)? = null
+
     /** 宿主在本实例上最后一次显式 setEnabled 的值（null = 没调过，按盘上标记判定；初值 = 构造时的 `initialEnabled`）。 */
     @Volatile
     var requestedEnabled: Boolean? = initialEnabled
@@ -1156,6 +1160,14 @@ internal class RetrieverClient(
                 val resp = transport.send(send.request)
                 val cancelled = resp == null && cancelEpoch.get() != epoch
                 val eff = onWork { engine.handleResponse(send.name, resp, send.keyFp, send.baseUrl, cancelled) }
+                // 进入鉴权暂停：引擎线程外、不持锁时出 `key_rejected`（出口抛什么都吞掉）
+                eff.keyRejected?.let { r ->
+                    try {
+                        onKeyRejected?.invoke(r)
+                    } catch (t: Throwable) {
+                        // 出口本身失败：吞掉
+                    }
+                }
                 if (eff.fetchConfig) fetchConfig()
             }
             onWork {

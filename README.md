@@ -71,6 +71,30 @@ Java：`Retriever.configure(ctx, key)`、`Retriever.log(LogLevel.ERROR, "msg", "
 | `rtv.reconfigure_ignored` | 首次之后的 `configure` 改了 `processName` | `field`: `process_name` |
 | `rtv.install_repaired` / `rtv.install_reset` | `install.json` 损坏（0.2.0 起） | 见 CHANGELOG 0.2.0 |
 
+## 接错 key / 地址时怎么看（0.3.0 起，ADR 0025）
+
+key 或 baseUrl 写错时，日志流本身正好传不上去——所以 SDK 把诊断写进 **logcat**（tag `Retriever`）。接入、换 key、换环境之后看一眼：
+
+```bash
+adb logcat -s Retriever
+```
+
+| code | 何时 | 级别 | logcat 消息 |
+|---|---|---|---|
+| `no_key` | key 为空（null / `""` / 纯空白） | I | `no key configured; logs are written locally and never uploaded` |
+| `key_trimmed` | key 首尾带空白 / 控制字符（CI secret 尾部换行最常见），已去掉 | W | `key had leading or trailing whitespace; it was trimmed` |
+| `key_malformed` | key 不符合 `lk_<live\|test>_<app>_<32 hex>_<crc>` 或校验位不对 | W | `key is not a valid Retriever key (format or checksum mismatch); the server will reject it` |
+| `key_env_mismatch` | test key 配生产地址 `logs.revdog.org`，或 live key 配 staging 地址 `logs-staging.revdog.org` | W | `key environment does not match the endpoint (test key with production endpoint, or live key with staging endpoint); the server will reject it` |
+| `base_url_invalid` | baseUrl 不是带主机的 `http` / `https` 绝对地址（缺 scheme、`ftp://`、空串） | W | `baseUrl is not a valid http(s) URL; uploads will fail` |
+| `key_rejected` | 服务端拒绝当前 key（401 / 403 且回了 `reason`），上传进入暂停 | W | `server rejected the key (HTTP <status>, reason=<reason>); uploads paused for <N> min; logs are kept locally` |
+
+- **SDK 不会因此停写本地**：诊断只是说出来，不拦请求、不改写入——前五条是 `configure` 时的本地检查，请求照发、由服务端裁决；
+  被拒后暂停上传（1 h 起倍增到 24 h），本地照写，key 改对后（换 key 立即清暂停）积压的批照常补传。
+- key 与 baseUrl 在 `configure` 里先去掉首尾空白与控制字符再用（唯一的行为变化：带空白的 key 原本必然被拒）。
+- 不传 baseUrl 时默认是生产地址：test key 不传 baseUrl 会出 `key_env_mismatch`。自定义主机（本机、自建）不判环境。
+- 同一（code, key, baseUrl）每进程只出一次；消息是写死的英文句子，**不含 key 的任何部分**，可以放心贴给别人。`setEnabled(false)` 时照常出。
+- 边缘 / WAF / captive portal 代答的 401 / 403（HTML、没有 `reason`）不出 `key_rejected`（按普通失败退避）；换 key 之前发出的请求回来的 401 也不出。
+
 ## 同意与清空（0.2.0 起的语义，ADR 0019 / 0020；0.3.0 补充）
 
 - **`setEnabled(false)` 跨重启有效**：落盘为 root 同级的空标记文件 `noBackupFilesDir/retriever.disabled`，直到 `setEnabled(true)`。

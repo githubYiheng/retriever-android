@@ -15,6 +15,9 @@ internal sealed class SendStep {
 internal class ResponseEffect {
     var fetchConfig = false
     var acked = false
+
+    /** 本次响应让当前 key 进入了鉴权暂停：调用方在引擎线程外出 `key_rejected` 诊断（ADR 0025）。 */
+    var keyRejected: KeyRejection? = null
 }
 
 internal class ConfigEffect {
@@ -141,12 +144,16 @@ internal fun Engine.handleResponse(
         }
         // 只有服务端明确表态（JSON 对象且 reason 是字符串，未知值也算）才鉴权暂停；边缘 / WAF / captive portal
         // 替服务端回的 401 / 403（HTML、空体、无 reason）按「其它」退避并计 fail（ADR 0011）
-        401, 403 -> if (fp != keyFp || base != baseUrl) {
-            // 旧 key 在途请求的拒绝：不暂停、不退避、不计毒批——这一批下次用当前 key 照常发
-        } else if (body?.get("reason") is String) {
-            authPause()
-        } else {
-            failure(name, null, "http_${response.status}", true)
+        401, 403 -> {
+            val reason = body?.get("reason") as? String
+            if (fp != keyFp || base != baseUrl) {
+                // 旧 key 在途请求的拒绝：不暂停、不退避、不计毒批——这一批下次用当前 key 照常发
+            } else if (reason != null) {
+                // 当前 key 进入鉴权暂停：带上状态码 / reason / 时长，交给调用方出 `key_rejected`（ADR 0025）
+                eff.keyRejected = KeyRejection(response.status, reason, authPause(), fp, base)
+            } else {
+                failure(name, null, "http_${response.status}", true)
+            }
         }
         // 切分写不出（磁盘满等）：原批保留，按普通失败退避（不计毒批，批本身没错），免得每 2 s 重发一次再 413
         413 -> if (!split413(name)) failure(name, null, "http_413", false)
@@ -250,8 +257,8 @@ private fun Engine.failure(name: String, retryAfterS: Int?, reason: String, coun
     if (f.count >= Limits.POISON_CONSECUTIVE_FAILS && f.otherSuccess) quarantine(name)
 }
 
-/** 401 / 403 带 reason：全局暂停 1 h 起倍增到 24 h；照常写本地、照常拉配置；不删任何文件。 */
-private fun Engine.authPause() {
+/** 401 / 403 带 reason：全局暂停 1 h 起倍增到 24 h；照常写本地、照常拉配置；不删任何文件。返回本次暂停时长（ms）。 */
+private fun Engine.authPause(): Long {
     val prev: Long? = if (backoff.reason.startsWith("auth:")) backoff.reason.substring(5).toLongOrNull() else null
     val dur = if (prev != null) minOf(prev * 2, Limits.PAUSE_401_MAX_MS) else Limits.PAUSE_401_BASE_MS
     backoff.pausedCategories = listOf("all")
@@ -259,6 +266,7 @@ private fun Engine.authPause() {
     backoff.pausedUntilMs = clock.wallMs() + dur
     backoff.reason = "auth:$dur"
     persistBackoff()
+    return dur
 }
 
 /** 429：按 categories 暂停到 now + retry_after_s（单调；钳制 1 s–1 h；±20% 抖动）；`all` = 全局。不计毒批。 */

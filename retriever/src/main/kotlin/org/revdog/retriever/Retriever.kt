@@ -9,6 +9,7 @@ import org.revdog.retriever.android.AndroidPlatform
 import org.revdog.retriever.android.LifecycleTracker
 import org.revdog.retriever.android.TaggedTransport
 import org.revdog.retriever.core.Clock
+import org.revdog.retriever.core.ConfigCheck
 import org.revdog.retriever.core.Device
 import org.revdog.retriever.core.DropCounter
 import org.revdog.retriever.core.HttpUrlTransport
@@ -73,45 +74,57 @@ public object Retriever {
      * 首次调用：建实例（同步 bootstrap 会话）并收编 configure 之前的行。之后的调用：同参数 = 只更新 redact；
      * `processName` 与首次不同 → 忽略这一项并留合成 warn `rtv.reconfigure_ignored`，其余参数照常生效（宿主默认在本线程上同步生效）。
      * 参数都可空：key null = ""（只写本地不上传）、baseUrl null = 默认、options null = 默认值。
+     * key 与 baseUrl 先去掉首尾空白与控制字符，之后一切用途都用修剪后的值；写错时在 logcat（tag `Retriever`）出诊断（ADR 0025）。
      */
     @JvmStatic
     @JvmOverloads
     public fun configure(context: Context?, key: String?, baseUrl: String? = DEFAULT_BASE_URL, options: Options? = null) {
         try {
-            val opts = options ?: Options()
-            val k = key ?: ""
-            val base = baseUrl ?: DEFAULT_BASE_URL
-            if (context != null) attach(context, false)
-            synchronized(lock) {
-                val e = env() ?: return
-                val root = e.root ?: return
-                val p = e.platform
-                val token = p.allowDiskWrites()
-                try {
-                    val name = RetrieverClient.sanitizeProcessName(opts.processName ?: p.autoProcessName())
-                    val c = instance
-                    if (c != null) {
-                        c.reconfigure(k, base, opts, name)
-                        return
-                    }
-                    val pf = PreLog.handoff()
-                    val client = try {
-                        RetrieverClient(root, k, base, opts, e.clock, e.transport(), p, pendingEnabled, PreLog.pendingUser, pf)
-                    } catch (t: Throwable) {
-                        PreLog.handoffFailed()
-                        throw t
-                    }
-                    client.onInternalError = internalErrorSink
-                    instance = client
-                    PreLog.configured()
-                    pendingEnabled = null
-                    client.start()
-                } finally {
-                    p.restoreDiskPolicy(token)
-                }
+            val raw = key ?: ""
+            // 修剪在两条路径（建实例 / reconfigure）之前：指纹、请求头、端点、同参数判定都用修剪后的值
+            val k = ConfigCheck.trim(raw)
+            val base = ConfigCheck.trim(baseUrl ?: DEFAULT_BASE_URL)
+            try {
+                configureInstance(context, k, base, options ?: Options())
+            } finally {
+                // 诊断在锁外、实例处理完之后出；只出诊断不改行为，出口抛什么都吞掉
+                ConfigDiagnostics.configured(raw, k, base)
             }
         } catch (t: Throwable) {
             // 绝不抛给宿主
+        }
+    }
+
+    private fun configureInstance(context: Context?, k: String, base: String, opts: Options) {
+        if (context != null) attach(context, false)
+        synchronized(lock) {
+            val e = env() ?: return
+            val root = e.root ?: return
+            val p = e.platform
+            val token = p.allowDiskWrites()
+            try {
+                val name = RetrieverClient.sanitizeProcessName(opts.processName ?: p.autoProcessName())
+                val c = instance
+                if (c != null) {
+                    c.reconfigure(k, base, opts, name)
+                    return
+                }
+                val pf = PreLog.handoff()
+                val client = try {
+                    RetrieverClient(root, k, base, opts, e.clock, e.transport(), p, pendingEnabled, PreLog.pendingUser, pf)
+                } catch (t: Throwable) {
+                    PreLog.handoffFailed()
+                    throw t
+                }
+                client.onInternalError = internalErrorSink
+                client.onKeyRejected = { r -> ConfigDiagnostics.rejected(r) }
+                instance = client
+                PreLog.configured()
+                pendingEnabled = null
+                client.start()
+            } finally {
+                p.restoreDiskPolicy(token)
+            }
         }
     }
 
@@ -511,6 +524,7 @@ public object Retriever {
             markerCache = null
             testEnv = env
             internalErrorSink = null
+            ConfigDiagnostics.resetForTesting()
             PreLog.resetForTesting()
             DropCounter.reset()
         }

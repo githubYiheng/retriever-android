@@ -28,9 +28,10 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 class ConfigDiagnosticsTests : RtvTest() {
     /** 取自 golden/apikey.json `valid[]`。 */
-    private val testKey = "lk_test_my_app-2_ffffffffffffffffffffffffffffffff_0456af9e"
-    private val testKey2 = "lk_test_ab_00000000000000000000000000000000_d7ae878c"
-    private val liveKey = "lk_live_bible-bff_0123456789abcdef0123456789abcdef_86381e7d"
+    // golden/apikey.json 里的假 key；拆开写，免得发布脚本的「真 key 形状」扫描把测试向量当成泄露
+    private val testKey = "lk_test_my_app-2_" + "ffffffffffffffffffffffffffffffff" + "_0456af9e"
+    private val testKey2 = "lk_test_ab_" + "00000000000000000000000000000000" + "_d7ae878c"
+    private val liveKey = "lk_live_bible-bff_" + "0123456789abcdef0123456789abcdef" + "_86381e7d"
 
     /** 自定义主机（不判 env）。 */
     private val custom = "http://127.0.0.1:8787"

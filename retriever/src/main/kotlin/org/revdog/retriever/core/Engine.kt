@@ -48,8 +48,27 @@ internal class Engine(
     @Volatile
     var key: String = key
 
-    var host: HostDefaults = HostDefaults.of(options)
+    /** key 指纹（ADR 0024 决定 7）：sha256(key) 前 16 位十六进制，key 为空 = 空串。 */
+    val keyFp: String get() = Ids.keyFingerprint(key)
+
+    /** 宿主默认只存一份（简报 §2）：在写入侧，configure 在宿主线程上同步改它；引擎从同一处读。 */
+    val host: HostDefaults get() = writer.host
     var sdkVersion: String = options.sdkVersion
+
+    /** 本实例收编的 pre 文件名（bootstrap 时记进 meta.json 的 `pre`；提交 / 放弃后为 null）。 */
+    var adoptPre: String? = null
+
+    /** 会话目录 / 段文件在运行中消失（封段时 rename 失败且文件已不在）：交给客户端重新 bootstrap（简报 §4.5）。 */
+    var onVanished: (() -> Unit)? = null
+
+    /** 物化时段文件读失败（非 ENOENT）：本次不推进，定时重试（ADR 0024 决定 3）。 */
+    var readRetryPending = false
+
+    /** 本次 bootstrap 之后恢复旧会话已经成功做完：之前一律不驱逐（拿不到 root 锁跳过的不算，定时重试）。 */
+    var recovered = false
+
+    /** bootstrap 判出的待写合成行（install 修复 / 重建）：bootstrap 没成功时留着，重试成功后照写。 */
+    private val pendingSynth = ArrayList<Triple<String, String, Map<String, Any?>?>>()
 
     var install: InstallInfo? = null
     var current: SessionRecord? = null
@@ -75,7 +94,7 @@ internal class Engine(
     var inFlight: String? = null
     var lastRequestMono: Long? = null
 
-    /** 当前会话 meta.json 上的锁（进程存活期间一直持有；进程死亡由内核释放）。 */
+    /** 当前会话目录 `lock` 文件上的锁（进程存活期间一直持有；进程死亡由内核释放）。 */
     var sessionLock: SessionLock? = null
 
     /** 最近被 2xx 确认的 primary 区间（flush 判断「这一批已确认」用；只留最近 512 个）。 */
@@ -102,7 +121,7 @@ internal class Engine(
             f["os"] ?: "", f["os_version"] ?: "", f["model"] ?: "", f["app_version"] ?: "",
             f["build"] ?: "", f["locale"] ?: "", "retriever-android/${options.sdkVersion}",
         ).sanitized()
-        effective = ConfigCache.effective(null, host, clock.wallMs(), clock.monoMs())
+        effective = ConfigCache.effective(null, writer.host, clock.wallMs(), clock.monoMs())
     }
 
     // MARK: 路径
@@ -117,7 +136,10 @@ internal class Engine(
     val configFile: File get() = File(root, "config.json")
 
     /** `setEnabled(false)` 的落盘标记：root **同级**的空文件 `<root>.disabled`，存在 = 禁用（ADR 0020 决定 2）；清空 root 碰不到它。 */
-    val disabledFile: File get() = File(root.absoluteFile.parentFile, root.name + ".disabled")
+    val disabledFile: File get() = Markers.file(root)
+
+    /** configure 之前的行所在目录（`<root>/pre/`，ADR 0023）。 */
+    val preDir: File get() = File(root, PreFile.DIR)
 
     val sdkHeader: String get() = "retriever-android/$sdkVersion"
 
@@ -128,21 +150,32 @@ internal class Engine(
     /**
      * 建目录、install.json（首次生成 createNewFile 临时文件 → sync → rename，失败方重读；读到但解析不了 = 损坏，
      * 同一把锁内从会话 meta.json 的副本修复身份，没有副本才清空 root 新建，都留痕，ADR 0019 决定 7 / 8）、计数器 +1、新会话。
+     * meta.json 必须写成，写不成 = bootstrap 失败（ADR 0024 决定 2：不允许「有会话、没 meta」）。收编中时 meta 记 `pre`。
      */
     fun bootstrap(): Boolean {
         if (!Fs.ensureDir(root) || !Fs.ensureDir(procDir) || !Fs.ensureDir(outboxDir)) return false
         val result = locks.withDirLock { bumpInstallLocked() } ?: return false
+        // install 修复 / 重建的合成行先记下：后面的步骤失败、bootstrap 重试时照样写（install.json 已经修好，重试判不出来了）
+        if (result.repaired) pendingSynth.add(Triple("install.json unreadable; identity repaired from session meta", "rtv.install_repaired", null))
+        result.reset?.let { r ->
+            pendingSynth.add(Triple("install.json unreadable; local state discarded", "rtv.install_reset", mapOf("batches" to r.batches, "sessions" to r.sessions)))
+        }
         // 清空时 root 整个改了名：锁 channel 还开在旧的 upload.lock 上，关掉，之后按需在新 root 重开
         if (result.reset != null) locks.close()
         val inst = result.info
-        install = inst
         val now = clock.wallMs()
         val sid = Ids.newV4()
         val dir = File(procDir, sid)
         if (!Fs.ensureDir(dir)) return false
-        val meta = SessionMeta(sid, result.sessionNo, now, device, processName, inst.installId)
-        Fs.writeAtomic(File(dir, "meta.json"), meta.encode())
+        // 先加会话锁、再写 meta：别的进程的恢复流程永远看不到「有 meta、没锁」的活会话
         lockSessionDir(dir)
+        val meta = SessionMeta(sid, result.sessionNo, now, device, processName, inst.installId, adoptPre)
+        if (!Fs.writeAtomic(File(dir, "meta.json"), meta.encode())) {
+            releaseSessionLock()
+            Fs.remove(dir)
+            return false
+        }
+        install = inst
         val fg = platform.isForeground()
         val cursor = Cursor(lastState = fg?.let { if (it) "fg" else "bg" }, lastStateMs = now)
         val rec = SessionRecord(meta, dir, cursor, ArrayList())
@@ -150,15 +183,50 @@ internal class Engine(
         writeCursor(rec)
         writer.startSession(dir, sid)
         loadPersistentState()
-        // 留一条合成行，服务端据此解释这台设备的状态（同 rtv.flush 合成行的写法）
-        if (result.repaired) syntheticWarn(now, "install.json unreadable; identity repaired from session meta", "rtv.install_repaired", null)
-        result.reset?.let { r ->
-            syntheticWarn(
-                now, "install.json unreadable; local state discarded", "rtv.install_reset",
-                mapOf("batches" to r.batches, "sessions" to r.sessions),
-            )
-        }
+        // 留一条合成行，服务端据此解释这台设备的状态（同 rtv.flush 合成行的写法）；收编中时进 pre 文件（r = 1），收编时排在 configure 之前的行之后
+        for ((msg, tag, attrs) in pendingSynth) syntheticWarn(now, msg, tag, attrs)
+        pendingSynth.clear()
         return true
+    }
+
+    /** 收编提交后清掉 meta.json 的 `pre`（写不成也无妨：所指文件已不在 = 已提交）。 */
+    fun clearMetaPre(rec: SessionRecord) {
+        if (rec.meta.pre == null) return
+        val m = rec.meta.copy(pre = null)
+        Fs.writeAtomic(File(rec.dir, "meta.json"), m.encode())
+    }
+
+    /** 给孤儿 pre 文件分配一个 session_no（install.json 计数器 +1；install 已换了就不分配）。 */
+    fun allocateSessionNo(): Long? {
+        val iid = install?.installId ?: return null
+        return locks.withDirLock {
+            val inst = Fs.read(installFile)?.let { InstallInfo.decode(it) } ?: return@withDirLock null
+            if (inst.installId != iid) return@withDirLock null
+            inst.sessionCounter += 1
+            if (!Fs.writeAtomic(installFile, inst.encode())) null else inst.sessionCounter
+        }
+    }
+
+    /** 清空 / 目录消失后重建之前：丢掉内存里属于旧 root 的全部状态。 */
+    fun resetState() {
+        metas.clear()
+        embeddedDrops.clear()
+        embeddedClosed.clear()
+        pendingMapping = null
+        mapping = null
+        others.clear()
+        fails.clear()
+        inFlight = null
+        backoff = BackoffState()
+        ackedRanges.clear()
+        backfilledSegs.clear()
+        configCache = null
+        lastConfigFetchMono = null
+        install = null
+        current = null
+        readRetryPending = false
+        recovered = false
+        pendingSynth.clear()
     }
 
     private fun syntheticWarn(now: Long, msg: String, tag: String, attrs: Map<String, Any?>?) {
@@ -168,7 +236,7 @@ internal class Engine(
 
     fun lockSessionDir(dir: File) {
         releaseSessionLock()
-        sessionLock = SessionLock.tryAcquire(File(dir, "meta.json"))
+        sessionLock = SessionLock.tryAcquire(dir)
     }
 
     fun releaseSessionLock() {
@@ -287,62 +355,95 @@ internal class Engine(
 
     // MARK: 清空（ADR 0019 决定 9：先改名再删）
 
-    /**
-     * root 整个改名为同级的 `<root>.purge-<uuid>`：之后的递归删除只碰改过名的目录，中途被杀也不会留下半个 root 与新 install 混用。
-     * 返回改名后的目录；root 不存在或改名失败返回 null。
-     */
-    fun moveRootAside(): File? {
-        val parent = root.absoluteFile.parentFile ?: return null
-        if (!root.exists()) return null
-        val dst = File(parent, root.name + PURGE_INFIX + Ids.newV4())
-        return if (root.renameTo(dst)) dst else null
-    }
+    /** root 整个改名为同级的 `<root>.purge-<uuid>`（与 configure 之前的 purge 同一实现，[RootPurge]）。 */
+    fun moveRootAside(): File? = RootPurge.moveAside(root)
 
     /** 启动时清掉上次清空没删完的 `<root>.purge-*`。 */
     fun removePurgeLeftovers() {
-        val parent = root.absoluteFile.parentFile ?: return
-        val prefix = root.name + PURGE_INFIX
-        for (n in Fs.list(parent)) if (n.startsWith(prefix)) Fs.remove(File(parent, n))
+        RootPurge.removeLeftovers(root)
     }
 
     // MARK: 启用状态（ADR 0020 决定 2）
 
-    fun disabledMarked(): Boolean = disabledFile.exists()
+    /** 禁用标记三态（ADR 0024 决定 6）：未知按禁用处理。 */
+    fun markerState(): Markers.State = Markers.state(root)
+
+    /** 标记在或判定不了（未知按禁用，fail-closed）。 */
+    fun disabledMarked(): Boolean = markerState() != Markers.State.ABSENT
 
     /**
-     * 上传 / 拉配置 / 排后台作业 = 本进程内存开关 ∧ 盘上无标记（每次决策 stat 一次：别的进程的禁用在这里生效）。
+     * 上传 / 拉配置 / 排后台作业 = 本进程内存开关 ∧ 盘上无标记（每次决策判一次：别的进程的禁用在这里生效；判定不了按禁用）。
      * 内存开关读 Writer 的（setEnabled 在调用线程上同步改它）；[enabled] 要等引擎线程那一跳，落盘之前已排队的选批 / 拉配置会漏过去。
      */
     fun uploadAllowed(): Boolean = writer.isEnabled && !disabledMarked()
 
     /** 写禁用标记（空文件，createNewFile 原子创建）；失败记 [markerPending]，由调度 tick 重试。 */
     fun markDisabled() {
-        val ok = try {
-            disabledFile.createNewFile() || disabledFile.exists()
-        } catch (e: IOException) {
-            false
-        }
-        markerPending = !ok
+        markerPending = !Markers.mark(root)
     }
 
     /** 删禁用标记；删不掉返回 false（调用方保持禁用：宁可不传，也不误传）。 */
     fun clearDisabledMarker(): Boolean {
         markerPending = false
-        return !disabledFile.exists() || disabledFile.delete() || !disabledFile.exists()
+        return Markers.clear(root)
     }
 
+    /**
+     * 读跨启动状态。退避 / 映射 / 配置缓存都带 key 指纹 + baseUrl（ADR 0024 决定 7）：与当前不同——退避与暂停不继承、
+     * 映射按未确认（needMapping 比对指纹）、配置缓存按身份过期并在启动时重拉。
+     * 旧版本（0.1.x / 0.2.x）写的文件没有这两个键：视为与当前相同（升级本身不清退避、不重发映射、不丢配置缓存），并把当前值补写进去。
+     */
     private fun loadPersistentState() {
         val nowWall = clock.wallMs()
         val nowMono = clock.monoMs()
-        Fs.read(backoffFile)?.let { b -> BackoffState.decodeColdStart(b, nowWall, nowMono)?.let { backoff = it } }
-        Fs.read(mappingFile)?.let { mapping = MappingState.decode(it) }
+        val fp = keyFp
+        Fs.read(backoffFile)?.let { b ->
+            BackoffState.decodeColdStart(b, nowWall, nowMono)?.let { s ->
+                if (sameIdentity(s.hasIdentity, s.keyFp, s.baseUrl)) {
+                    backoff = s
+                    if (!s.hasIdentity) persistBackoff()
+                } else {
+                    backoff = s.forIdentity(fp, baseUrl)
+                    persistBackoff()
+                }
+            }
+        }
+        Fs.read(mappingFile)?.let { b ->
+            val m = MappingState.decode(b)
+            mapping = m
+            if (m != null && !m.hasIdentity) {
+                val filled = m.copy(keyFp = fp, baseUrl = baseUrl, hasIdentity = true)
+                mapping = filled
+                Fs.writeAtomic(mappingFile, filled.encode())
+            }
+        }
         Fs.read(configFile)?.let { b ->
-            val o = JsonIn.obj(b)
-            val fetched = JsonIn.int64(o?.get("fetched_ms"))
-            if (o != null && fetched != null) configCache = ConfigCache(ConfigRules.clamp(o["config"], host), fetched, null)
+            val c = ConfigCache.decodeFile(b, host, fp, baseUrl, writer.currentUser)
+            configCache = c
+            if (c != null && c.legacyIdentity) Fs.writeAtomic(configFile, c.encodeFile())
         }
         effective = ConfigCache.effective(configCache, host, nowWall, nowMono)
-        writer.setLevels(effective.uploadLevel, effective.config.localLevel, effective.config.flushIntervalS)
+        writer.setConfigSnapshot(configCache)
+    }
+
+    /** 文件里记的身份与当前相同；两个键都没有（旧版本写的，`present` = false）按相同处理；只要有且任一不符 = 不同。 */
+    fun sameIdentity(present: Boolean, fp: String?, base: String?): Boolean = !present || (fp == keyFp && base == baseUrl)
+
+    /**
+     * configure / reconfigure 后（引擎线程）：key 指纹或 baseUrl 变了 → 清鉴权暂停与退避、映射按未确认、配置缓存按身份过期
+     * （调用方立即重拉）。返回是否变了。
+     */
+    fun applyIdentity(newKey: String, newBaseUrl: String): Boolean {
+        val oldFp = keyFp
+        val oldBase = baseUrl
+        key = newKey
+        baseUrl = newBaseUrl
+        if (keyFp == oldFp && baseUrl == oldBase) return false
+        backoff = backoff.forIdentity(keyFp, baseUrl)
+        persistBackoff()
+        configCache = configCache?.staleForIdentity()
+        lastConfigFetchMono = null
+        return true
     }
 
     // MARK: 状态文件
@@ -352,6 +453,8 @@ internal class Engine(
     }
 
     fun persistBackoff() {
+        backoff.keyFp = keyFp
+        backoff.baseUrl = baseUrl
         Fs.writeAtomic(backoffFile, backoff.encode())
     }
 
@@ -364,14 +467,19 @@ internal class Engine(
 
     // MARK: 封段处理（sync → rename → 物化 → 原子写 cursor）
 
-    /** 处理写入侧交来的全部封段任务；返回是否有新批次产生。 */
+    /**
+     * 处理写入侧交来的全部封段任务；返回是否有新批次产生。收编提交之前什么都不做（会话 S 不物化、不记墓碑，ADR 0023）——
+     * 封段任务留在写入侧，提交后再处理。
+     */
     fun processSeals(): Boolean {
+        if (writer.isAdopting) return false
         val jobs = writer.takePendingSeals()
         val cur = current
         if (jobs.isEmpty() || cur == null) {
             flushTombstones()
             return false
         }
+        var vanished = false
         for (j in jobs) {
             try {
                 j.out?.fd?.sync()
@@ -386,9 +494,19 @@ internal class Engine(
             val info = j.info
             val openFile = info.file
             val sealedFile = File(openFile.parentFile, Segments.name(info.segNo, false))
-            if (openFile.renameTo(sealedFile)) info.file = sealedFile
+            if (openFile.renameTo(sealedFile)) {
+                info.file = sealedFile
+            } else if (Fs.isMissing(openFile) && !sealedFile.exists() && !cur.dir.isDirectory) {
+                // 会话目录在运行中被删（root 被删、别的进程清空）：这一段的行随之没了，按段计数（同 iOS），重新 bootstrap（简报 §4.5）
+                vanished = true
+                if (info.lineCount > 0) {
+                    DropCounter.putBack(DropCounter.Snapshot(info.lineCount.toLong(), info.errorLines.toLong(), info.firstTs, info.lastTs))
+                }
+                continue
+            }
             if (openFile.parentFile == cur.dir) cur.sealed.add(info)
         }
+        if (vanished) onVanished?.invoke()
         val last = jobs[jobs.size - 1]
         val noCtx = jobs.any { it.noCtx }
         val ignoreCap = jobs.any { it.reason == SealReason.FLUSH || it.reason == SealReason.FATAL || it.reason == SealReason.SHUTDOWN }
@@ -399,12 +517,26 @@ internal class Engine(
         return batchesWritten != before
     }
 
+    /** 物化积压（段读失败没推进的义务行）：定时器上重试。 */
+    fun retryBacklog() {
+        val cur = current ?: return
+        if (writer.isAdopting) return
+        val lastOseq = cur.sealed.maxOfOrNull { it.lastOseq } ?: 0
+        if (lastOseq <= cur.cursor.extractedThroughOseq) {
+            readRetryPending = false
+            return
+        }
+        readRetryPending = false
+        materialize(cur, lastOseq, cur.sealed.lastOrNull()?.lastSeq ?: 0, false, false)
+    }
+
     // MARK: 墓碑与终态（drops.jsonl / sessions.jsonl：追加写，各自上限 1000 条）
 
     fun lastAckAge(at: Long): Long = if (backoff.lastAckMs < 0) -1 else maxOf(0, at - backoff.lastAckMs)
 
-    /** 写入侧的 write_failed 墓碑：可写时落盘。 */
+    /** 写入侧的 write_failed 墓碑：可写时落盘（收编提交之前不记：未提交的收编重做时 oseq 会重新分配）。 */
     fun flushTombstones() {
+        if (writer.isAdopting) return
         val failed = writer.takeFailed()
         val cur = current
         if (failed.isEmpty() || cur == null) return
@@ -423,7 +555,7 @@ internal class Engine(
                 Fs.writeAtomic(dropsFile, Jsonl.encodeDrops(capDrops(all, embeddedDrops, ClientConstants.DROPS_FILE_MAX_ENTRIES)))
             }
             true
-        }
+        } ?: false
     }
 
     /** 会话终态落盘（只为 last_oseq > 0 的会话写，调用方保证）；超上限删最旧的未在途条目。 */
@@ -436,7 +568,7 @@ internal class Engine(
                 Fs.writeAtomic(sessionsFile, Jsonl.encodeClosed(capClosed(all, embeddedClosed, ClientConstants.DROPS_FILE_MAX_ENTRIES)))
             }
             true
-        }
+        } ?: false
     }
 
     fun readDropsLocked(): List<DropEntry> = Jsonl.read(dropsFile).mapNotNull { DropEntry.decode(it) }
@@ -462,12 +594,12 @@ internal class Engine(
         todayCount += 1
     }
 
-    /** 所有自己进程目录里的会话记录（当前 + 旧）。 */
+    /** 所有自己进程目录里的会话记录（当前 + 旧；旧的按 started_ms，孤儿 pre 文件收编出的会话 session_no 是事后分配的）。 */
     val ownSessions: List<SessionRecord>
         get() {
             val out = ArrayList<SessionRecord>()
             current?.let { out.add(it) }
-            out.addAll(others.values.sortedBy { it.meta.sessionNo })
+            out.addAll(others.values.sortedWith(compareBy<SessionRecord>({ it.meta.startedMs }, { it.meta.sessionNo })))
             return out
         }
 

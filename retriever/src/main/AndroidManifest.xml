@@ -19,12 +19,15 @@
             android:permission="android.permission.BIND_JOB_SERVICE" />
 
         <!--
-          只记下 Application context（不做任何磁盘 I/O），让 configure 之前的 log() 也能落盘
-          （方案 §3.10「存储层不依赖 key」）。只在默认进程实例化；宿主可用 tools:node="remove" 去掉。
+          只记下 Application context、注册进程级前后台 tracker（不做任何磁盘 I/O），让 configure 之前的 log() 也能落盘
+          （ADR 0023：写进 pre 文件，configure 时收编）、前后台状态从进程一开始就对。只在默认进程实例化；
+          initOrder 调高：早于多数库的 provider（App Startup 等默认 0），它们构造期打的日志也有 context 可写。
+          宿主可用 tools:node="remove" 去掉（之后 configure 之前的行只计数）。
         -->
         <provider
             android:name="org.revdog.retriever.RetrieverInitProvider"
             android:authorities="${applicationId}.retriever-init"
-            android:exported="false" />
+            android:exported="false"
+            android:initOrder="1000" />
     </application>
 </manifest>

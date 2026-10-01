@@ -38,7 +38,7 @@ private object HeadlessPlatform : Platform {
 
     override fun availableBytes(dir: File): Long? = null
 
-    override fun scheduleUploadJob(jobId: Int) = Unit
+    override fun scheduleUploadJob(jobId: Int): Boolean = true
 
     override fun cancelUploadJob(jobId: Int) = Unit
 
@@ -49,12 +49,83 @@ private object HeadlessPlatform : Platform {
     override fun restoreDiskPolicy(token: Any?) = Unit
 }
 
+/** 静态入口的环境：给定 root、真时钟、不联网。 */
+private fun staticEnv(root: File) = Retriever.Env(root, HeadlessPlatform, JvmClock()) { NoTransport }
+
+/** pre 文件的测试行：每 10 行一条 warn，每 50 行一条 error，其余交替 debug / info；第 n/2 行之前 setUser。 */
+private fun preLines(n: Int) {
+    for (i in 1..n) {
+        if (i == n / 2 + 1) Retriever.setUser("killed-user")
+        val level = when {
+            i % 50 == 0 -> LogLevel.ERROR
+            i % 10 == 0 -> LogLevel.WARN
+            i % 2 == 0 -> LogLevel.INFO
+            else -> LogLevel.DEBUG
+        }
+        Retriever.log(level, "pre $i", "kill", mapOf("i" to i), null)
+    }
+}
+
+/**
+ * 简报 §11 D / E / J：
+ *   --pre <root> <N>                 configure 之前写 N 行后 halt（下次启动作为孤儿收编）
+ *   --pre-hold <root> <N>            configure 之前写 N 行后打印 ready 并一直活着（持 flock），等父进程杀
+ *   --adopt-crash <root> <N> <point> configure 之前写 N 行，然后 configure；收编走到 <point>（record:k / before_commit / after_unlink）时 halt
+ */
+private fun preMode(args: Array<String>) {
+    if (args[0] == "--probe-lock") {
+        // 另一个进程看某个会话目录的锁：locked / free
+        val l = org.revdog.retriever.core.SessionLock.tryAcquire(File(args[1]))
+        println(if (l == null) "locked" else "free")
+        l?.release()
+        System.out.flush()
+        Runtime.getRuntime().halt(0)
+    }
+    val root = File(args[1])
+    val n = args[2].toInt()
+    Retriever.resetForTesting(staticEnv(root))
+    preLines(n)
+    when (args[0]) {
+        "--pre" -> Unit
+        "--pre-hold" -> {
+            println("ready")
+            System.out.flush()
+            System.`in`.read()
+            return
+        }
+        "--adopt-crash", "--adopt-crash-writing" -> {
+            val point = args[3]
+            val writing = args[0] == "--adopt-crash-writing"
+            org.revdog.retriever.core.TestHooks.adoption = { p ->
+                // 收编期间宿主还在写（configure 之后的行 = r = 1，追加到 pre 文件尾）
+                if (writing && p == "record:30") {
+                    val t = Thread { for (k in 0 until 10) Retriever.log(LogLevel.WARN, "post $k", "kill") }
+                    t.start()
+                    t.join()
+                }
+                if (p == point) Runtime.getRuntime().halt(137)
+            }
+            Retriever.configure(null, "", "https://invalid.example", Options().apply { uploadLevel = LogLevel.INFO })
+            // 收编在引擎线程上；走到崩溃点之前别退出（没走到 = 测试失败：父进程会看到退出码不是 137）
+            Thread.sleep(10_000)
+        }
+    }
+    println("pre=$n")
+    System.out.flush()
+    Runtime.getRuntime().halt(137)
+}
+
 fun main(args: Array<String>) {
+    if (args[0].startsWith("--")) {
+        preMode(args)
+        return
+    }
     val root = File(args[0])
     val n = args[1].toInt()
     val torn = args.contains("--torn")
     // key 为空：不上传（不联网），只验证落盘与恢复
     val client = RetrieverClient(root, "", "https://invalid.example", Options(), JvmClock(), NoTransport, HeadlessPlatform)
+    client.start()
     for (i in 1..n) {
         val level = when {
             i % 1000 == 0 -> LogLevel.ERROR

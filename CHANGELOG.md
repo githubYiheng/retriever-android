@@ -2,6 +2,59 @@
 
 Retriever monorepo `sdk/android`。版本号遵循语义化版本：修订号 = 只修 bug；次版本 = 公开 API 只增；主版本 = 公开 API 有减或改。
 
+## [0.3.0] - 2026-10-01
+
+configure 顺序与宿主误用加固批（ADR 0022「配置响应标明取自宿主默认的字段」、ADR 0023「configure 之前没有实例」、ADR 0024「宿主误用加固」），
+与 iOS `retriever-ios` 0.3.0 同口径。公开 API 只增（参数由非空放宽为可空，源码与二进制都兼容）；0.1.x / 0.2.x 留在盘上的全部状态照读。
+
+### 迁移说明
+- **多数宿主无需改代码。** 照旧在 `Application.onCreate` 里 `configure`；之前为了「先 configure 再打日志」做的初始化顺序调整可以保留，但不再必要。
+- 单元测试的宿主进程会跑宿主的 `Application.onCreate`：测试里别注入真 key。开发机切换环境（staging ↔ 生产 / 换 app 的 key）前先 `purgeLocal()` 或卸载。
+- 撤回同意的完整组合是 `setEnabled(false)` + `purgeLocal()` + `setUser(null)`（`purgeLocal` 不清用户）。
+- 用 WorkManager / 自有 JobScheduler 作业的宿主：确认 `Options.jobId`（默认 `0x5254`）不在你的 id 区间里——同 id 是别人的作业时 SDK 不再替换它，只是排不上兜底作业。
+
+### 行为变化（宿主请看）
+- **`configure` 之前没有实例**：之前的 `log()` 只追加到 `noBackupFilesDir/retriever/pre/<uuid>.jsonl`，`configure` 时按**本次 configure** 的设定收编
+  （过 redact、判上传义务、分 seq / oseq、error 去抖 / fatal 换段 / 用户边界照常）。原先懒建一个按内置默认 Options 判定的实例，先 log 后 configure 的宿主
+  启动头几行是否上传取决于缓存新旧与线程调度，还会按默认上限提前驱逐、按默认级别恢复旧会话。configure 之前不驱逐、不联网、不排作业、不恢复旧会话；
+  `installId` / `supportCode` 为 null，`uploadLevel` / `localLevel` 为 warn / debug；`flush` 回 `Pending("paused")`；`purgeLocal` 真清（pre 文件与 root）。
+  pre 文件上限 1 MB；configure 之前进程就死 → 之后某次启动 configure 时作为独立会话收编上传。
+- **redact 也作用于 configure 之前的行**（在收编时、可能在 SDK 线程上调）：redact 必须线程安全；它改 `ts` 无效（取回原值）。
+- **实例身份只认首次 `configure`**：之后改 `processName` 被忽略并留合成 warn `rtv.reconfigure_ignored`；「换进程名 → 关旧实例建新实例」的路径删除。
+  参数完全相同的重复 `configure` 只更新 redact、不再发配置请求。再次 `configure` 改的级别在调用线程上同步生效（之后立即写的行按新级别）。
+- **配置缓存只记远程明确给的值**：响应的 `from_host`（服务端已上线）列出的宿主型字段永远取当前宿主默认——宿主改了 Options 立即、确定地生效，
+  不再被上次请求头的回显覆盖到缓存过期。配置请求的身份加上四项宿主默认与 key 指纹：请求在途时它们变了，响应丢弃并重拉。
+  SDK 钳制 `local_cap_bytes` 的缺省改为宿主值（对齐服务端权威实现）。
+- **没落盘的行必须计数**：configure 之前超 1 MB / 写失败 / 拿不到 context、已 configure 却没有会话（bootstrap 失败、目录被删）、level 为 null、
+  内部异常——一律计数，有可写会话后写合成 warn `rtv.pre_init_dropped`（attrs `count` / `error_count` / `first_ts` / `last_ts`）。原先静默丢弃。
+  建会话必须确认 `meta.json` 写成，写不成按失败重试。
+- **公开入口不抛、不崩宿主**：`configure` 的 context / key / baseUrl / options、`log` 的 level、`flush` / `purgeLocal` 的回调、`Options` 的引用类型 setter
+  都可传 null；`msg ?: error.toString()` 这类会调宿主代码的求值也在兜底之内；attrs / 异常逐值防护（`toString` / `toDouble` / `getMessage` 抛异常、
+  循环引用、并发修改 → 该值写 `"<unprintable>"` 并标 `truncated`，行照常落盘）；flush 回调必回、任何路径都吞掉回调抛的 Throwable；
+  `RetrieverLog` 的落点吞掉 Error。
+- attrs 里的数组 / Collection / Map 渲染成紧凑 JSON 文本（`[1,2,3]`），原先是 `[I@1a2b3c` / `[1, 2]`；超过 32 键时取 map 迭代顺序的前 32 个再排序（原先全排序后取前 32 个）。
+- **禁用标记 fail-closed**：标记判定不了（目录列不出、I/O 错误、首次解锁前）按禁用处理，之后每次建会话成功、每次定时唤醒重判；configure 之前的
+  `isEnabled` 也按标记判定（拿不到 context 时判定不了 = false）。configure 之前的 `setEnabled` 当场落盘 / 删除标记。
+- **换 key 不带旧 key 的账**：`backoff.json`、`mapping.json`、`config.json` 记 key 指纹（sha256 前 16 位十六进制）与 baseUrl；换了就清鉴权暂停与退避、
+  映射重发、配置按新身份重拉；旧 key 在途请求的 401 / 403 不暂停新 key。出站箱旧批照常用当前 key 发。
+- **强制换段有节流**：fatal 10 s 窗口内只有第一条立即换段、排作业，其余并入 error 去抖封段；已有等待中的 flush 且之后没有新义务行时，新的 flush 挂到同一个等待上。
+- 前后台状态从进程一开始就对：init provider 里注册进程级 tracker（按 Activity 身份集合计数，没见过 onStart 的 Activity 的 onStop 不参与）；
+  provider 加 `android:initOrder="1000"`。`configure` 在 `attachBaseContext` 里传 base context 时，provider 稍后补注册生命周期。
+- JobScheduler 作业认归属：同 id 是别人的作业不跳过、不取消、不替换；`setPersisted(true)` 因缺 `RECEIVE_BOOT_COMPLETED` 失败时退回非持久作业。
+- 读失败 ≠ 没有内容：物化时段文件读不出不推进游标（定时重试），文件确已不存在才记墓碑后推进；目录锁拿不到时不执行临界区。
+  会话目录 / root 在运行中被删：重新建会话并写合成 warn `rtv.root_vanished`。
+- 行的级别 / ctx / synthetic / 是否已合成 `rtv.unclean_exit` 按解析位置判断，attrs 里的同名键不再影响物化优先级、413 切分与恢复判重。
+- `setUser` 清洗后为空（`""`、纯空白、纯控制字符）= null。SDK 自己取消的请求（purge、后台作业被停）不计入毒批失败次数。
+
+### 新增
+- 合成行 `rtv.pre_init_dropped`、`rtv.root_vanished`、`rtv.reconfigure_ignored`。
+- `Options.setUploadLevel(LogLevel?)` / `setLocalLevel(LogLevel?)` / `setSdkVersion(String?)`（Java 侧 setter 接受 null；Kotlin 照常用属性赋值）。
+- 示例 app 场景 `preconfigure`、`preconfigure_kill`、`late_configure`（两步：先记一次性标记退出进程，再冷启动跑）。
+
+### 盘上格式（全部是新文件 / 可选键；降级到 0.2.x 时 pre 文件留在盘上不被收编，升回来再收编）
+- 新目录 `pre/`（`<uuid>.jsonl`）；`meta.json` 可选键 `pre`；`config.json` 加 `from_host`、`key_fp`、`base_url`；`backoff.json` / `mapping.json` 加 `key_fp`、`base_url`。
+- 旧文件没有这些键：`from_host` 缺失 = 空集（同 0.2.x）；指纹缺失 = 视为当前 key（升级不清退避、不重发映射、不丢配置缓存），读到后补写当前值。
+
 ## [0.2.0] - 2026-10-01
 
 遗留修复批（ADR 0019「本地状态自带真实归属」、ADR 0020「宿主线程不等待 SDK；`setEnabled` 落盘」），与 iOS `retriever-ios` 0.2.0 同口径。

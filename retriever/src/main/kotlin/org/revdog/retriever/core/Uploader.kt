@@ -6,7 +6,8 @@ import kotlin.random.Random
 // 出站队列与响应分类（§3.6 / §3.7，宪法 R-2 / R-3）。决策在引擎线程上，网络在引擎线程外。与 iOS `Uploader.swift` 逐字一致。
 
 internal sealed class SendStep {
-    class Send(val name: String, val request: HttpRequest) : SendStep()
+    /** `keyFp` / `baseUrl`：这次请求用的 key 指纹与 baseUrl（响应回来时 key 已换 → 401 / 403 不暂停新 key，ADR 0024 决定 7）。 */
+    class Send(val name: String, val request: HttpRequest, val keyFp: String, val baseUrl: String) : SendStep()
 
     class Stop(val reason: String, val wakeMono: Long?) : SendStep()
 }
@@ -24,8 +25,18 @@ internal class ConfigEffect {
     var stale = false
 }
 
-/** 配置请求与请求时的身份 (install_id, user_id)：响应只在身份未变时生效。 */
-internal class ConfigFetch(val request: HttpRequest, val installId: String, val userId: String?)
+/**
+ * 配置请求与请求时的身份 = install + user + 四项宿主默认 + key 指纹 + baseUrl（ADR 0019 决定 12 / ADR 0022 / ADR 0024 决定 7）：
+ * 响应只在身份未变时生效，否则丢弃并重拉。
+ */
+internal class ConfigFetch(
+    val request: HttpRequest,
+    val installId: String,
+    val userId: String?,
+    val host: HostDefaults,
+    val keyFp: String,
+    val baseUrl: String,
+)
 
 /**
  * 选下一批：p0 > p1 > p2，同级 created_ms 升序（失败过的批让到后面，避免头阻塞）；单在途；相邻请求 ≥ 2 s；
@@ -79,7 +90,7 @@ internal fun Engine.nextSend(): SendStep {
         )
         inFlight = pick.name
         lastRequestMono = nowMono
-        return SendStep.Send(pick.name, req)
+        return SendStep.Send(pick.name, req, keyFp, baseUrl)
     }
     return SendStep.Stop("unreadable", null)
 }
@@ -94,12 +105,25 @@ internal fun Engine.releaseUploadLock() {
 
 // MARK: 响应分类
 
-internal fun Engine.handleResponse(name: String, response: HttpResponse?): ResponseEffect {
+/**
+ * `sentKeyFp` / `sentBaseUrl`：请求所用的 key 指纹与 baseUrl（null = 当前）；与当前不同时 401 / 403 不暂停（新 key 不背旧 key 的账），
+ * 其余结果照常处理（2xx 仍确认）。`cancelledBySdk`：SDK 自己取消的请求（purge、作业被停）——不计毒批失败次数（ADR 0024 决定 10）。
+ */
+internal fun Engine.handleResponse(
+    name: String,
+    response: HttpResponse?,
+    sentKeyFp: String? = null,
+    sentBaseUrl: String? = null,
+    cancelledBySdk: Boolean = false,
+): ResponseEffect {
     val eff = ResponseEffect()
     if (inFlight == name) inFlight = null
     val meta = metas[name] ?: return eff
+    val fp = sentKeyFp ?: keyFp
+    val base = sentBaseUrl ?: baseUrl
     if (response == null) {
-        failure(name, null, "network", true)
+        // SDK 自己取消的请求（purge、后台作业被停）：既不计失败也不动退避（ADR 0024 决定 10）
+        if (!cancelledBySdk) failure(name, null, "network", true)
         return eff
     }
     val body = JsonIn.obj(response.body)
@@ -107,7 +131,7 @@ internal fun Engine.handleResponse(name: String, response: HttpResponse?): Respo
         in 200..299 -> {
             // 回显的 batch_id 与本批一致才算确认（防 captive portal）；stored 与 quarantined 都算
             if (body != null && (body["batch_id"] as? String) == meta.batchId) {
-                ack(meta, (body["status"] as? String) == "stored")
+                ack(meta, (body["status"] as? String) == "stored", fp, base)
                 eff.acked = true
                 val e = body["config_etag"] as? String
                 if (e != null && e != (configCache?.config?.etag ?: "")) eff.fetchConfig = true
@@ -117,7 +141,13 @@ internal fun Engine.handleResponse(name: String, response: HttpResponse?): Respo
         }
         // 只有服务端明确表态（JSON 对象且 reason 是字符串，未知值也算）才鉴权暂停；边缘 / WAF / captive portal
         // 替服务端回的 401 / 403（HTML、空体、无 reason）按「其它」退避并计 fail（ADR 0011）
-        401, 403 -> if (body?.get("reason") is String) authPause() else failure(name, null, "http_${response.status}", true)
+        401, 403 -> if (fp != keyFp || base != baseUrl) {
+            // 旧 key 在途请求的拒绝：不暂停、不退避、不计毒批——这一批下次用当前 key 照常发
+        } else if (body?.get("reason") is String) {
+            authPause()
+        } else {
+            failure(name, null, "http_${response.status}", true)
+        }
         // 切分写不出（磁盘满等）：原批保留，按普通失败退避（不计毒批，批本身没错），免得每 2 s 重发一次再 413
         413 -> if (!split413(name)) failure(name, null, "http_413", false)
         429 -> categoryPause(body, response.headers["retry-after"])
@@ -147,7 +177,7 @@ internal fun backoffMs(attempt: Int): Long {
     return jitter(base)
 }
 
-private fun Engine.ack(meta: BatchMeta, stored: Boolean) {
+private fun Engine.ack(meta: BatchMeta, stored: Boolean, sentKeyFp: String, sentBaseUrl: String) {
     val nowWall = clock.wallMs()
     Fs.remove(File(outboxDir, meta.name))
     metas.remove(meta.name)
@@ -157,9 +187,9 @@ private fun Engine.ack(meta: BatchMeta, stored: Boolean) {
         ackedRanges.add(AckedRange(meta.sessionId, meta.oseqFrom, meta.oseqTo))
         if (ackedRanges.size > 512) ackedRanges.subList(0, ackedRanges.size - 512).clear()
     }
-    // 删已报墓碑与会话终态（按原样匹配）
+    // 删已报墓碑与会话终态（按原样匹配）。目录锁拿不到：文件不改，条目留在「在途」集合里（本进程不再重复携带，下次启动再带一次）
     if (meta.drops.isNotEmpty() || meta.closed.isNotEmpty()) {
-        locks.withDirLock {
+        val done = locks.withDirLock {
             if (meta.drops.isNotEmpty()) {
                 val gone = meta.drops.toSet()
                 Fs.writeAtomic(dropsFile, Jsonl.encodeDrops(readDropsLocked().filter { it !in gone }))
@@ -168,15 +198,19 @@ private fun Engine.ack(meta: BatchMeta, stored: Boolean) {
                 val gone = meta.closed.map { it.sessionId }.toSet()
                 Fs.writeAtomic(sessionsFile, Jsonl.encodeClosed(readClosedLocked().filter { it.sessionId !in gone }))
             }
+            true
+        } ?: false
+        if (done) {
+            embeddedDrops.removeAll(meta.drops.toSet())
+            embeddedClosed.removeAll(meta.closed.map { it.sessionId }.toSet())
         }
-        embeddedDrops.removeAll(meta.drops.toSet())
-        embeddedClosed.removeAll(meta.closed.map { it.sessionId }.toSet())
     }
     val d = meta.mappingDigest
     if (meta.hasMapping && d != null) {
         // 服务端只在 stored 时写映射：被隔离的批不算映射已确认；别的 install 的批也不算本 install 的（ADR 0019 决定 10）
-        if (stored && meta.installId == install?.installId) {
-            val m = MappingState(meta.mappingUser, d, nowWall)
+        // 旧 key / 旧服务端的请求得到的 2xx：批照常确认，但不算映射已确认（ADR 0024 决定 7）
+        if (stored && meta.installId == install?.installId && sentKeyFp == keyFp && sentBaseUrl == baseUrl) {
+            val m = MappingState(meta.mappingUser, d, nowWall, keyFp, baseUrl)
             mapping = m
             Fs.writeAtomic(mappingFile, m.encode())
         }
@@ -263,6 +297,7 @@ internal fun Engine.configRequest(): ConfigFetch? {
     if (key.isEmpty() || !uploadAllowed()) return null
     val inst = install ?: return null
     val user = writer.currentUser
+    val host = this.host
     val h = linkedMapOf(
         "Authorization" to "Bearer $key",
         "X-Rtv-Install" to inst.installId,
@@ -277,7 +312,7 @@ internal fun Engine.configRequest(): ConfigFetch? {
     user?.let { h["X-Rtv-User"] = percentEncode(it) }
     // 发起即记「上次尝试时刻」：请求在途期间轮询候选不再是过去时（否则调度器以 0 ms 自旋到响应回来）
     lastConfigFetchMono = clock.monoMs()
-    return ConfigFetch(HttpRequest("GET", endpoint("v1/config"), h, null), inst.installId, user)
+    return ConfigFetch(HttpRequest("GET", endpoint("v1/config"), h, null), inst.installId, user, host, keyFp, baseUrl)
 }
 
 internal fun percentEncode(s: String): String {
@@ -297,21 +332,23 @@ internal fun percentEncode(s: String): String {
 
 /**
  * 拉到配置：钳制后缓存并生效；拉不到 / 非 200 / 非对象 → 用缓存（不放大）。配置属于请求时的身份（ADR 0019 决定 12）：
- * 请求发出后 install_id 或 user_id 变了 → 丢弃（`stale`），调用方按新身份重拉。
+ * 请求发出后 install_id、user_id、宿主默认、key 指纹或 baseUrl 变了 → 丢弃（`stale`），调用方按新身份重拉。
+ * 缓存只记远程明确给的值：响应的 `from_host` 一并存下，生效时这些字段取当前宿主默认（ADR 0022）。
  */
 internal fun Engine.applyConfigResponse(fetch: ConfigFetch, r: HttpResponse?): ConfigEffect {
     lastConfigFetchMono = clock.monoMs()
-    if (fetch.installId != install?.installId || fetch.userId != writer.currentUser) return ConfigEffect().apply { stale = true }
+    if (fetch.installId != install?.installId || fetch.userId != writer.currentUser || fetch.host != host ||
+        fetch.keyFp != keyFp || fetch.baseUrl != baseUrl
+    ) {
+        return ConfigEffect().apply { stale = true }
+    }
     if (r == null || r.status != 200) return ConfigEffect()
     val o = JsonIn.obj(r.body) ?: return ConfigEffect()
     val cfg = ConfigRules.clamp(o, host)
     val nowWall = clock.wallMs()
-    configCache = ConfigCache(cfg, nowWall, clock.monoMs())
-    val file = JsonOut()
-    file.raw("{\"fetched_ms\":"); file.int(nowWall)
-    file.raw(",\"config\":"); file.raw(ConfigRules.encode(cfg))
-    file.raw("}")
-    Fs.writeAtomic(configFile, file.toByteArray())
+    val cache = ConfigCache(cfg, nowWall, clock.monoMs(), false, ConfigRules.fromHost(o["from_host"]), fetch.keyFp, fetch.baseUrl, userId = fetch.userId)
+    configCache = cache
+    Fs.writeAtomic(configFile, cache.encodeFile())
     return applyEffective()
 }
 
@@ -320,7 +357,8 @@ internal fun Engine.applyEffective(): ConfigEffect {
     val eff = ConfigEffect()
     val old = effective
     effective = ConfigCache.effective(configCache, host, clock.wallMs(), clock.monoMs())
-    writer.setLevels(effective.uploadLevel, effective.config.localLevel, effective.config.flushIntervalS)
+    // 写入侧用同一份不可变快照 + 它自己持有的宿主默认重算级别（宿主线程上的 configure 不会被这里覆盖回旧值）
+    writer.setConfigSnapshot(configCache)
     if (!old.fullDumpActive && effective.fullDumpActive) {
         writer.rotate(SealReason.FULL_DUMP)
         processSeals()

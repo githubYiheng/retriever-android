@@ -25,18 +25,63 @@ internal object LineEncoder {
         val truncated: Boolean,
     )
 
-    /** 从宿主 Throwable 构造 exc（§3.1）：type = javaClass.name、message = message ?: ""、stack = 平台栈（空串视同无）。 */
-    fun exception(t: Throwable, stackOf: (Throwable) -> String): LogException {
+    /**
+     * 从宿主 Throwable 构造 exc（§3.1）：type = javaClass.name、message = message ?: ""、stack = 平台栈（空串视同无）。
+     * `getMessage()` 抛异常（懒拼 message 的自定义异常）→ message 写占位串，返回值第二项 = true（该行标 truncated）；
+     * 取栈抛任何东西 → 无栈。绝不抛给宿主（ADR 0024 决定 5）。
+     */
+    fun exception(t: Throwable, stackOf: (Throwable) -> String): Pair<LogException, Boolean> {
+        var bad = false
+        val message = try {
+            t.message ?: ""
+        } catch (e: Throwable) {
+            bad = true
+            ClientConstants.UNPRINTABLE
+        }
         val stack = try {
             stackOf(t)
-        } catch (e: RuntimeException) {
+        } catch (e: Throwable) {
             ""
         }
-        return LogException(t.javaClass.name, t.message ?: "", stack.ifEmpty { null })
+        return Pair(LogException(t.javaClass.name, message, stack.ifEmpty { null }), bad)
     }
 
-    fun encode(line: LogLine, synthetic: Boolean = false): Encoded {
-        var truncated = false
+    /** `msg` 为 null 时的取值：有异常取 `toString()`（抛异常 → 占位串，second = true），否则空串。 */
+    fun messageOf(msg: String?, error: Throwable?): Pair<String, Boolean> {
+        if (msg != null) return Pair(msg, false)
+        if (error == null) return Pair("", false)
+        return try {
+            Pair(error.toString(), false)
+        } catch (e: Throwable) {
+            Pair(ClientConstants.UNPRINTABLE, true)
+        }
+    }
+
+    /**
+     * 收编时给 redact 钩子看的行：把 pre 文件里的行体（`"ts":…}`，可带结尾 `\n`）解回 [LogLine]。
+     * 返回 (行, synthetic, truncated)；解不出返回 null（该行按坏记录跳过）。attrs 的数字解成 Double（重编码时按 JS 数字格式，整数逐字节不变）。
+     */
+    fun decodeBody(body: ByteArray): Triple<LogLine, Boolean, Boolean>? {
+        var end = body.size
+        if (end > 0 && body[end - 1].toInt() == 0x0A) end -= 1
+        val buf = ByteArray(end + 1)
+        buf[0] = 0x7B
+        System.arraycopy(body, 0, buf, 1, end)
+        val o = JsonIn.obj(buf) ?: return null
+        val ts = JsonIn.int64(o["ts"]) ?: return null
+        val level = LogLevel.ofWire(o["level"] as? String) ?: return null
+        val msg = o["msg"] as? String ?: return null
+        val tag = o["tag"] as? String
+        val attrs = JsonIn.asObj(o["attrs"])
+        val exc = JsonIn.asObj(o["exc"])?.let { e ->
+            LogException((e["type"] as? String) ?: "", (e["message"] as? String) ?: "", e["stack"] as? String)
+        }
+        return Triple(LogLine(ts, level, msg, tag, attrs, exc), o["synthetic"] == true, o["truncated"] == true)
+    }
+
+    /** `forceTruncated`：行在编码之前就已经丢过东西（值求值出错、收编前已截断）。 */
+    fun encode(line: LogLine, synthetic: Boolean = false, forceTruncated: Boolean = false): Encoded {
+        var truncated = forceTruncated
 
         val mc = Text.truncate(line.msg, Limits.LINE_MSG_BYTES)
         var msg = mc.s
@@ -51,8 +96,13 @@ internal object LineEncoder {
 
         var attrsJson: ByteArray? = null
         val a = line.attrs
-        if (a != null && a.isNotEmpty()) {
-            val r = encodeAttrs(a)
+        if (a != null) {
+            // 宿主的 map：size / 迭代都可能抛，全部在 encodeAttrs 里兜住
+            val r = try {
+                encodeAttrs(a)
+            } catch (t: Throwable) {
+                Pair(null, true)
+            }
             attrsJson = r.first
             truncated = truncated || r.second
         }
@@ -120,55 +170,69 @@ internal object LineEncoder {
     }
 
     /**
-     * attrs：键按字典序；≤ 32 键；贪心装入直到序列化 ≤ 4096 B。值：String / Boolean / null 原样；
+     * attrs：先对宿主的 map 取浅拷贝快照，且只取前 32 个非 null 键（迭代顺序；先截到上限再排序，百万级键不全排序）；
+     * 键按字典序；贪心装入直到序列化 ≤ 4096 B。值：String / Boolean / null 原样；
      * 整数型（Byte / Short / Int / Long / AtomicInteger / AtomicLong / BigInteger / 无小数位的 BigDecimal）|v| ≤ 2^53 − 1
      * 输出 JSON 数字、超出输出十进制字符串（ADR 0020 决定 3，golden `attrs.json`；值没丢，不打 truncated）；
-     * 其余 Number 按 JS 数字格式（非有限数转 "NaN" / "Infinity" / "-Infinity"）；其它 `toString()`。
+     * 其余 Number 按 JS 数字格式（非有限数转 "NaN" / "Infinity" / "-Infinity"）；
+     * 数组 / Collection / Map 渲染成紧凑 JSON 文本作字符串值（有上限：文本超过 4096 B 跳过该键、嵌套超过 8 层写占位串；方案 §3.1）；
+     * 其它 `toString()`。逐值防护（ADR 0024 决定 5）：单个值求值抛任何东西（toString / toDouble 抛异常、间接循环引用的
+     * StackOverflowError）→ 该值写占位串 `"<unprintable>"` 并标 truncated，行照常落盘；拷贝快照时并发修改 → 已拿到的键照用、标 truncated。
      * 字符串先按预算截再转义：UTF-16 长度超过预算的键 / 值转义后必然超预算，直接跳过，不整串转义（超长值不做数倍分配）。
      * 返回 (JSON 或 null, 是否截断)。
      */
     fun encodeAttrs(attrs: Map<String, Any?>): Pair<ByteArray?, Boolean> {
         var truncated = false
-        // Java 调用方可能塞 null 键：跳过（绝不因宿主的 map 抛异常丢整行）
-        val present = ArrayList<String>(attrs.size)
-        for (k in attrs.keys) {
-            @Suppress("SENSELESS_COMPARISON")
-            if (k != null) present.add(k)
-        }
-        if (present.size != attrs.size) truncated = true
-        var keys: List<String> = present.sorted()
-        if (keys.size > Limits.LINE_ATTRS_KEYS) {
-            keys = keys.subList(0, Limits.LINE_ATTRS_KEYS)
+        val keys = ArrayList<String>(minOf(attrs.size, Limits.LINE_ATTRS_KEYS))
+        val vals = HashMap<String, Any?>()
+        try {
+            for (e in attrs.entries) {
+                val k = e.key
+                // Java 调用方可能塞 null 键：跳过（绝不因宿主的 map 抛异常丢整行）
+                @Suppress("SENSELESS_COMPARISON")
+                if (k == null) {
+                    truncated = true
+                    continue
+                }
+                if (keys.size >= Limits.LINE_ATTRS_KEYS) {
+                    truncated = true
+                    break
+                }
+                keys.add(k)
+                vals[k] = e.value
+            }
+        } catch (t: Throwable) {
+            // 并发修改 / 宿主 map 的迭代器抛异常
             truncated = true
         }
+        keys.sort()
         val out = JsonOut(256)
         out.byte(0x7B)
         var count = 0
         for (k in keys) {
-            val v = attrs[k]
-            val text = when (v) {
-                null, is Boolean, is Number -> null
-                is String -> v
-                else -> v.toString()
-            }
-            // 一个 UTF-16 单元至少 1 个 UTF-8 字节：长度超过预算的键 / 字符串值放不下，先判再转义
-            if (k.length > Limits.LINE_ATTRS_BYTES || (text != null && text.length > Limits.LINE_ATTRS_BYTES)) {
+            if (k.length > Limits.LINE_ATTRS_BYTES) {
                 truncated = true
                 continue
             }
-            val item = JsonOut(32)
+            var item = JsonOut(32)
             if (count > 0) item.raw(",")
             item.string(k)
             item.raw(":")
-            when (v) {
-                null -> item.raw("null")
-                is Boolean -> item.bool(v)
-                is Byte, is Short, is Int, is Long, is AtomicInteger, is AtomicLong -> integer(item, (v as Number).toLong())
-                is BigInteger -> integer(item, v)
-                is BigDecimal -> if (v.scale() <= 0) integer(item, v.toBigInteger()) else number(item, v)
-                is Number -> number(item, v)
-                else -> item.string(text ?: "")
+            val r = try {
+                value(item, vals[k])
+            } catch (t: Throwable) {
+                item = JsonOut(32)
+                if (count > 0) item.raw(",")
+                item.string(k)
+                item.raw(":")
+                item.string(ClientConstants.UNPRINTABLE)
+                VALUE_UNPRINTABLE
             }
+            if (r == VALUE_SKIP) {
+                truncated = true
+                continue
+            }
+            if (r == VALUE_UNPRINTABLE) truncated = true
             if (out.size + item.size + 1 > Limits.LINE_ATTRS_BYTES) {
                 truncated = true
                 continue
@@ -176,9 +240,121 @@ internal object LineEncoder {
             out.raw(item.toByteArray())
             count += 1
         }
-        if (count == 0) return Pair(null, truncated || attrs.isNotEmpty())
+        if (count == 0) return Pair(null, truncated || keys.isNotEmpty())
         out.byte(0x7D)
         return Pair(out.toByteArray(), truncated)
+    }
+
+    private const val VALUE_OK = 0
+    private const val VALUE_SKIP = 1
+    private const val VALUE_UNPRINTABLE = 2
+
+    /** 写一个 attrs 值；返回 OK / SKIP（放不下，跳过该键）/ UNPRINTABLE（写了占位串）。可能抛：调用方逐值兜住。 */
+    private fun value(item: JsonOut, v: Any?): Int {
+        when (v) {
+            null -> item.raw("null")
+            is Boolean -> item.bool(v)
+            is Byte, is Short, is Int, is Long, is AtomicInteger, is AtomicLong -> integer(item, (v as Number).toLong())
+            is BigInteger -> integer(item, v)
+            is BigDecimal -> if (v.scale() <= 0) integer(item, v.toBigInteger()) else number(item, v)
+            is Number -> number(item, v)
+            is String -> {
+                // 一个 UTF-16 单元至少 1 个 UTF-8 字节：长度超过预算的值放不下，先判再转义
+                if (v.length > Limits.LINE_ATTRS_BYTES) return VALUE_SKIP
+                item.string(v)
+            }
+            is CharSequence -> {
+                if (v.length > Limits.LINE_ATTRS_BYTES) return VALUE_SKIP
+                item.string(v.toString())
+            }
+            is Array<*>, is IntArray, is LongArray, is ShortArray, is ByteArray, is CharArray, is FloatArray, is DoubleArray,
+            is BooleanArray, is Collection<*>, is Map<*, *> -> {
+                val j = JsonOut(64)
+                if (!render(j, v, 0)) return VALUE_SKIP
+                if (j.size > Limits.LINE_ATTRS_BYTES) return VALUE_SKIP
+                item.string(String(j.toByteArray(), Charsets.UTF_8))
+            }
+            else -> {
+                val s = v.toString()
+                if (s.length > Limits.LINE_ATTRS_BYTES) return VALUE_SKIP
+                item.string(s)
+            }
+        }
+        return VALUE_OK
+    }
+
+    private class TooDeep : RuntimeException() {
+        override fun fillInStackTrace(): Throwable = this
+    }
+
+    /**
+     * 有上限的 JSON 渲染（数组 / 集合 → `[…]`、map → `{"k":…}`，元素规则同 attrs 值；其它对象 `toString()` 作字符串）。
+     * 文本超过 4096 B 立即停止返回 false（调用方跳过该键）；嵌套超过 8 层（含循环引用）抛出 → 占位串。
+     */
+    private fun render(o: JsonOut, v: Any?, depth: Int): Boolean {
+        if (o.size > Limits.LINE_ATTRS_BYTES) return false
+        if (depth > ClientConstants.ATTR_RENDER_MAX_DEPTH) throw TooDeep()
+        when (v) {
+            null -> o.raw("null")
+            is Boolean -> o.bool(v)
+            is Byte, is Short, is Int, is Long, is AtomicInteger, is AtomicLong -> integer(o, (v as Number).toLong())
+            is BigInteger -> integer(o, v)
+            is BigDecimal -> if (v.scale() <= 0) integer(o, v.toBigInteger()) else number(o, v)
+            is Number -> number(o, v)
+            is CharSequence -> {
+                if (v.length > Limits.LINE_ATTRS_BYTES) return false
+                o.string(v.toString())
+            }
+            is Array<*> -> return seq(o, v.size, depth) { v[it] }
+            is IntArray -> return seq(o, v.size, depth) { v[it] }
+            is LongArray -> return seq(o, v.size, depth) { v[it] }
+            is ShortArray -> return seq(o, v.size, depth) { v[it] }
+            is ByteArray -> return seq(o, v.size, depth) { v[it] }
+            is CharArray -> return seq(o, v.size, depth) { v[it].toString() }
+            is FloatArray -> return seq(o, v.size, depth) { v[it] }
+            is DoubleArray -> return seq(o, v.size, depth) { v[it] }
+            is BooleanArray -> return seq(o, v.size, depth) { v[it] }
+            is Collection<*> -> {
+                o.byte(0x5B)
+                var first = true
+                for (x in v) {
+                    if (!first) o.byte(0x2C)
+                    first = false
+                    if (!render(o, x, depth + 1)) return false
+                }
+                o.byte(0x5D)
+            }
+            is Map<*, *> -> {
+                o.byte(0x7B)
+                var first = true
+                for ((k, x) in v) {
+                    if (!first) o.byte(0x2C)
+                    first = false
+                    val ks = k?.toString() ?: "null"
+                    if (ks.length > Limits.LINE_ATTRS_BYTES) return false
+                    o.string(ks)
+                    o.byte(0x3A)
+                    if (!render(o, x, depth + 1)) return false
+                }
+                o.byte(0x7D)
+            }
+            else -> {
+                val s = v.toString()
+                if (s.length > Limits.LINE_ATTRS_BYTES) return false
+                o.string(s)
+            }
+        }
+        return o.size <= Limits.LINE_ATTRS_BYTES
+    }
+
+    private inline fun seq(o: JsonOut, n: Int, depth: Int, at: (Int) -> Any?): Boolean {
+        o.byte(0x5B)
+        for (i in 0 until n) {
+            if (i > 0) o.byte(0x2C)
+            if (!render(o, at(i), depth + 1)) return false
+        }
+        o.byte(0x5D)
+        return o.size <= Limits.LINE_ATTRS_BYTES
     }
 
     /** 2^53 − 1：JS `Number.MAX_SAFE_INTEGER`，查看端 `JSON.parse` 能精确表示的最大整数。 */
@@ -234,6 +410,25 @@ internal object LineEncoder {
         if (truncated) o.raw(",\"truncated\":true")
         o.raw("}\n")
         return o.toByteArray()
+    }
+
+    /** 行体开头固定为 `"ts":<整数>`：按位置取 ts（解析不出 = 0）。 */
+    fun tsOf(body: ByteArray): Long {
+        var i = 5
+        if (body.size < 6 || body[0].toInt() != 0x22 || body[1].toInt() != 0x74) return 0
+        var neg = false
+        if (i < body.size && body[i].toInt() == 0x2D) {
+            neg = true
+            i++
+        }
+        var v = 0L
+        var n = 0
+        while (i < body.size && body[i] >= 0x30 && body[i] <= 0x39 && n < 18) {
+            v = v * 10 + (body[i] - 0x30)
+            i++
+            n++
+        }
+        return if (neg) -v else v
     }
 
     /** 锁内拼前缀：`{"seq":N,` 或 `{"seq":N,"oseq":M,`。 */

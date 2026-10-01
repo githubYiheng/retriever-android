@@ -150,14 +150,17 @@ class GoldenTests {
     fun configClamp() {
         val g = Repo.golden("config.json")
         val vs = objs(g["clamp"])
-        assertEquals(50, vs.size)
+        assertTrue(vs.size >= 55)
+        assertTrue("含带 host.localCapBytes 的向量", vs.count { obj(it["host"]).containsKey("localCapBytes") } >= 5)
         for (v in vs) {
             val name = v["name"] as String
             val h = obj(v["host"])
+            // host.localCapBytes 缺省 = 内置 20 MB；给了就按 clampConfig 的 hostLocalCap 钳制（ADR 0022；golden 目前没有带它的向量）
             val host = HostDefaults(
                 LogLevel.ofWire(h["uploadLevel"] as? String) ?: LogLevel.WARN,
                 LogLevel.ofWire(h["localLevel"] as? String),
                 JsonIn.int64(h["dailyBatchCap"])?.toInt(),
+                ConfigRules.clampInt(JsonIn.double(h["localCapBytes"]), Limits.LOCAL_CAP_BYTES_MIN, Limits.LOCAL_CAP_BYTES_MAX, Limits.LOCAL_CAP_BYTES_DEFAULT),
             )
             val c = ConfigRules.clamp(v["raw"], host)
             val e = obj(v["expect"])

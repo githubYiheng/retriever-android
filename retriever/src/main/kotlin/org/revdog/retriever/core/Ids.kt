@@ -104,6 +104,21 @@ internal object Ids {
 
     /** 新的随机 UUID（v4，小写）。 */
     fun newV4(): String = UUID.randomUUID().toString()
+
+    /**
+     * key 指纹（ADR 0024 决定 7）：`sha256(key 的 UTF-8)` 的前 16 位小写十六进制；key 为空 → 空串。
+     * 退避 / 映射 / 配置缓存的身份各记一份，换 key 就不继承旧 key 的账。
+     */
+    fun keyFingerprint(key: String): String {
+        if (key.isEmpty()) return ""
+        val h = MessageDigest.getInstance("SHA-256").digest(Text.utf8(key))
+        val sb = StringBuilder(16)
+        for (k in 0 until 8) {
+            val x = h[k].toInt() and 0xFF
+            sb.append(HEX[x shr 4]).append(HEX[x and 0xF])
+        }
+        return sb.toString()
+    }
 }
 
 /** 日期（packages/core/src/object-key.ts）：ms UTC → `YYYY-MM-DD`；客户端 day 规则。不用 java.time（minSdk 24）。 */

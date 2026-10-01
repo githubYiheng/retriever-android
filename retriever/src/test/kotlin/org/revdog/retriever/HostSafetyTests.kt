@@ -226,21 +226,6 @@ class HostSafetyTests : RtvTest() {
         assertEquals(h.client.installId, h.transport.configRequests.last().headers["X-Rtv-Install"])
     }
 
-    /** 换进程名的 configure 调旧实例的 shutdown：换段后立即返回，封段物化在旧实例自己的引擎线程上做。 */
-    @Test
-    fun shutdownDoesNotWaitForEngine() {
-        val h = Harness(key = "")
-        h.settle()
-        h.l(LogLevel.WARN, "sealed by shutdown")
-        val gate = h.blockEngine()
-        val (returned, _) = callWithin(1000) { h.client.shutdown() }
-        gate.countDown()
-        assertTrue("shutdown 不等引擎线程", returned)
-        waitUntil { h.outboxFiles().isNotEmpty() }
-        assertEquals(1, h.outboxFiles("p1").size)
-        assertEquals(listOf("sealed by shutdown"), h.envelopes().single().lines.map { it["msg"] })
-    }
-
     // ---------------------------------------------------------------- 决定 2：setEnabled 落盘
 
     /** 禁用跨重启有效：重建实例后 log() 不占 seq，启动之后 0 次上传、0 次拉配置（出站箱预置了批）。旧实现重启回到启用。 */
@@ -346,7 +331,7 @@ class HostSafetyTests : RtvTest() {
         assertEquals(1, h.outboxFiles().size)
         val gate = h.blockEngine()
         // 开上传，并让排空的选批、拉配置的请求构造都排进引擎队列（在 setEnabled 的落盘之前）
-        h.client.reconfigure("lk_test_demo_abc_12345678", Harness.BASE, Options())
+        h.client.reconfigure("lk_test_demo_abc_12345678", Harness.BASE, Options(), h.client.processName)
         h.client.kickDrain()
         h.client.fetchConfig()
         Thread.sleep(50)
@@ -357,44 +342,6 @@ class HostSafetyTests : RtvTest() {
         assertEquals(0, h.transport.configRequests.size)
         assertEquals(1, h.outboxFiles().size)
         assertTrue(h.disabledMarker.exists())
-    }
-
-    /**
-     * 换进程名重建实例时带过去的是宿主在旧实例上最后一次显式 setEnabled（null = 没调过，新实例读盘上标记）：
-     * 盘上有标记、刚 setEnabled(true)（旧实例的落盘还没轮到）→ 新实例按 true 起来并删掉标记；显式 false 同样带过去。
-     * 旧实现启用时传 null 让新实例读盘，读到还没删的旧标记又禁用了。
-     */
-    @Test
-    fun explicitEnableCarriedAcrossProcessNameChange() {
-        val root = tempDir()
-        val marker = File(root.absoluteFile.parentFile, root.name + ".disabled")
-        assertTrue(marker.createNewFile())
-        val h = Harness(root = root, key = "")
-        h.settle()
-        assertFalse(h.client.isEnabled)
-        assertNull("没显式调过", h.client.requestedEnabled)
-        val gate = h.blockEngine()
-        h.client.setEnabled(true)
-        assertEquals(true, h.client.requestedEnabled)
-        assertTrue("旧实例还没删标记", marker.exists())
-        // 模拟 configure 换进程名：把旧实例的 requestedEnabled 作为新实例的初值
-        val h2 = Harness(
-            root = root, key = "", clock = h.clock, options = Options().apply { processName = "other" },
-            initialEnabled = h.client.requestedEnabled,
-        )
-        assertTrue(h2.client.isEnabled)
-        h2.settle()
-        assertFalse("新实例删了标记", marker.exists())
-        gate.countDown()
-        h.settle()
-        assertTrue(h.client.isEnabled)
-        assertTrue(h2.client.isEnabled)
-        h2.client.setEnabled(false)
-        val h3 = Harness(
-            root = root, key = "", clock = h.clock, options = Options().apply { processName = "third" },
-            initialEnabled = h2.client.requestedEnabled,
-        )
-        assertFalse(h3.client.isEnabled)
     }
 
     /** setEnabled(false) 取消排着的后台作业；禁用时进后台不排作业。 */

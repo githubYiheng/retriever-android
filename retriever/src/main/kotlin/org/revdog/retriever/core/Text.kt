@@ -160,12 +160,16 @@ internal object Text {
         return sb.toString()
     }
 
-    /** user_id：≤ 128 B、不含 C0 / DEL / C1 控制字符（服务端校验规则；不合规的批会进隔离区，所以在源头清洗）。 */
+    /**
+     * user_id：≤ 128 B、不含 C0 / DEL / C1 控制字符（服务端校验规则；不合规的批会进隔离区，所以在源头清洗）。
+     * 清洗后为空（`""`、纯空白、纯控制字符）= null（ADR 0024 决定 10）；空白 = Unicode White_Space（`Char.isWhitespace`）。
+     */
     fun sanitizeUserId(s: String?): String? {
         if (s == null) return null
         val sb = StringBuilder(s.length)
         for (ch in fixSurrogates(s)) if (!isControl(ch.code)) sb.append(ch)
-        return truncate(sb.toString(), Limits.USER_ID_BYTES).s
+        val out = truncate(sb.toString(), Limits.USER_ID_BYTES).s
+        return if (out.isBlank()) null else out
     }
 
     fun isControl(v: Int): Boolean = v <= 0x1F || (v in 0x7F..0x9F)

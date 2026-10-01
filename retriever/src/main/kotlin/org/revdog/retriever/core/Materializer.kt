@@ -37,20 +37,46 @@ internal fun Engine.materialize(s: SessionRecord, targetOseq: Long, targetSeq: L
     val from = s.cursor.extractedThroughOseq + 1
     val ob = ArrayList<Pair<OLine, String?>>()
     if (targetOseq >= from) {
+        val missing = ArrayList<SegInfo>()
         for (info in s.sealed) {
             if (!(info.obligCount > 0 && info.lastOseq >= from && info.firstOseq <= targetOseq)) continue
-            val f = load(info) ?: continue
+            // 读失败 ≠ 没有内容（ADR 0024 决定 3）：读失败（非 ENOENT）本次不推进、不删、留待下次；确已不存在 → 墓碑后推进
+            val f = when (val r = Fs.readResult(info.file)) {
+                is Fs.ReadResult.Ok -> Segments.parse(info.file, r.bytes, false)
+                Fs.ReadResult.Missing -> {
+                    missing.add(info)
+                    continue
+                }
+                Fs.ReadResult.Failed -> null
+            }
+            if (f == null) {
+                readRetryPending = true
+                return
+            }
+            cache[info.segNo] = f
             for (l in f.lines) {
                 if (l.oseq in from..targetOseq) {
                     ob.add(Pair(OLine(l.seq, l.oseq, l.ts, l.levelRank, f.data.copyOfRange(l.start, l.end)), info.userId))
                 }
             }
         }
+        if (missing.isNotEmpty()) {
+            val tombs = missing.map {
+                val a = maxOf(it.firstOseq, from)
+                val b = minOf(it.lastOseq, targetOseq)
+                DropEntry(s.meta.sessionId, a, b, b - a + 1, DropReason.CORRUPT, now, lastAckAge(now))
+            }
+            if (!appendDrops(tombs)) {
+                readRetryPending = true
+                return
+            }
+            s.sealed.removeAll(missing.toSet())
+        }
         ob.sortBy { it.first.oseq }
     }
     if (ob.isEmpty()) {
         if (targetOseq >= from) {
-            // 区间内的行都不在盘上（写失败 / 已驱逐，均已记墓碑）
+            // 区间内的行都不在盘上（写失败 / 已驱逐 / 段文件消失，均已记墓碑）
             s.cursor.extractedThroughOseq = targetOseq
             writeCursor(s)
         }
@@ -212,6 +238,8 @@ internal fun Engine.needMapping(user: String?, digest: String, now: Long): Boole
     val p = pendingMapping
     if (p != null && p.user == user && p.digest == digest) return false
     val m = mapping ?: return true
+    // 确认它的请求用的是别的 key / 服务端：对当前 key 按未确认（ADR 0024 决定 7）；旧版本写的（没有这两个键）按相同
+    if (!sameIdentity(m.hasIdentity, m.keyFp, m.baseUrl)) return true
     return m.userId != user || m.deviceDigest != digest || now - m.ackedMs >= Limits.MAPPING_REFRESH_MS
 }
 
@@ -225,7 +253,7 @@ internal fun Engine.takeExtras(): Extras = locks.withDirLock {
     val closed = readClosedLocked().filter { it.sessionId !in embeddedClosed }.take(Limits.CLOSED_SESSIONS_PER_BATCH)
     embeddedClosed.addAll(closed.map { it.sessionId })
     Extras(drops, closed)
-}
+} ?: Extras(emptyList(), emptyList())
 
 internal fun Engine.releaseExtras(e: Extras) {
     embeddedDrops.removeAll(e.drops.toSet())
@@ -258,18 +286,17 @@ internal fun Engine.writeBatch(h: EnvelopeHeader, lines: List<ByteArray>, prio: 
     return meta
 }
 
-private val LEVEL_WARN = Bytes.ascii("\"level\":\"warn\"")
-private val LEVEL_ERROR = Bytes.ascii("\"level\":\"error\"")
-private val LEVEL_FATAL = Bytes.ascii("\"level\":\"fatal\"")
-internal val CTX_MARK: ByteArray = Bytes.ascii(",\"ctx\":true")
-
+/**
+ * 批的元数据。级别与是否 ctx 按位置判断（ADR 0024 决定 9）：级别取行首固定前缀里解析出的值，ctx 看行尾固定位置——
+ * attrs 里的同名键（`level`、`ctx`）不影响优先级。解析不出前缀的行（读不出的旧批）保守按 warn 计。
+ */
 internal fun batchMeta(name: String, h: EnvelopeHeader, lines: List<ByteArray>, bytes: Long): BatchMeta {
     var warn = false
     var err = false
     for (l in lines) {
-        val e = Bytes.contains(LEVEL_ERROR, l) || Bytes.contains(LEVEL_FATAL, l)
-        if (e || Bytes.contains(LEVEL_WARN, l)) warn = true
-        if (e && !Bytes.contains(CTX_MARK, l)) err = true
+        val rank = Segments.parsePrefix(l, 0, l.size)?.levelRank ?: Level.WARN
+        if (rank >= Level.WARN) warn = true
+        if (rank >= Level.ERROR && !Segments.isCtxLine(l, 0, l.size)) err = true
     }
     val prio = OutboxName.parse(name)?.prio ?: 1
     val m = h.mapping

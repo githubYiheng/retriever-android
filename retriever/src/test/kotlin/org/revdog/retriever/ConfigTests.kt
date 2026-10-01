@@ -39,8 +39,9 @@ class ConfigTests : RtvTest() {
         h.client.log(LogLevel.INFO, "obligation now", null, null, null)
         assertEquals(before.first + 1, h.client.debugCounters.first)
         assertEquals(before.second + 1, h.client.debugCounters.second)
-        // 缓存到 config.json，重启后按墙钟兜底
-        val h2 = Harness(root = h.root, clock = h.clock, transport = FakeTransport())
+        // 缓存到 config.json（记拉它的用户），重启后（同一用户）按墙钟兜底
+        assertEquals("张三 u/1", h.readJson(java.io.File(h.root, "config.json"))["user_id"])
+        val h2 = Harness(root = h.root, clock = h.clock, transport = FakeTransport(), initialUser = "张三 u/1")
         h2.settle()
         val eff = h2.work { it.effective }
         assertEquals(LogLevel.INFO, eff.uploadLevel)

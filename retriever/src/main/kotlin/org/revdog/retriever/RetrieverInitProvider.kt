@@ -6,12 +6,17 @@ import android.database.Cursor
 import android.net.Uri
 
 /**
- * 只在进程启动时（Application.onCreate 之前）记下 Application context，不做任何磁盘 I/O；
- * 使 `configure` 之前的 `log()` 也能落盘（方案 §3.10）。只在默认进程实例化。不提供任何数据。
+ * 只在进程启动时（Application.onCreate 之前）记下 Application context、注册进程级前后台 tracker，不做任何磁盘 I/O；
+ * 使 `configure` 之前的 `log()` 也能落盘（ADR 0023：写进 pre 文件，configure 时收编）、前后台状态从进程一开始就对。
+ * 只在默认进程实例化（manifest 里 initOrder 调高，早于多数库的 provider）。不提供任何数据。
  */
 public class RetrieverInitProvider : ContentProvider() {
     override fun onCreate(): Boolean {
-        context?.let { Retriever.attachContext(it) }
+        try {
+            context?.let { Retriever.attachFromProvider(it) }
+        } catch (t: Throwable) {
+            // 绝不抛给宿主
+        }
         return true
     }
 

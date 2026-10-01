@@ -2,6 +2,7 @@ package org.revdog.retriever
 
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Before
 import org.junit.Assert.fail
 import org.revdog.retriever.core.BackoffState
 import org.revdog.retriever.core.Clock
@@ -172,6 +173,9 @@ internal class FakeTransport : Transport {
 
         /** 挂起直到 cancelAll */
         object Hang : Reply()
+
+        /** 等 [gate] 放行后回 [then]（模拟「请求在途时宿主换了 key」） */
+        class Gated(val gate: CountDownLatch, val then: Reply) : Reply()
     }
 
     private val lock = Any()
@@ -189,6 +193,13 @@ internal class FakeTransport : Transport {
 
     @Volatile
     var configEtag = "etag-0"
+
+    /**
+     * 回显模式（与 ingest 一致，ADR 0022）：响应 = configBody 里远程明确给的字段 + 没给的宿主型字段按请求头补齐，
+     * 并带 `from_host`（[hostDerivedFields] 的结果）。
+     */
+    @Volatile
+    var echoHost = false
 
     /** 非 null 时配置请求挂在这里直到放行（模拟「拉配置在途」）。 */
     @Volatile
@@ -232,7 +243,7 @@ internal class FakeTransport : Transport {
         if (rep == null) {
             configGate?.await(30, TimeUnit.SECONDS)
             val c = cfg ?: return HttpResponse(404)
-            return HttpResponse(200, emptyMap(), toJson(c).toByteArray())
+            return HttpResponse(200, emptyMap(), toJson(if (echoHost) echo(c, request.headers) else c).toByteArray())
         }
         return when (rep) {
             Reply.Echo -> HttpResponse(200, emptyMap(), toJson(mapOf("batch_id" to (bid ?: ""), "status" to "stored", "config_etag" to etag)).toByteArray())
@@ -249,7 +260,29 @@ internal class FakeTransport : Transport {
                 latch.await(30, TimeUnit.SECONDS)
                 null
             }
+            is Reply.Gated -> {
+                rep.gate.await(30, TimeUnit.SECONDS)
+                when (val t = rep.then) {
+                    is Reply.Status -> HttpResponse(t.code, t.headers, t.body?.let { toJson(it).toByteArray() } ?: ByteArray(0))
+                    else -> HttpResponse(200, emptyMap(), toJson(mapOf("batch_id" to (bid ?: ""), "status" to "stored", "config_etag" to etag)).toByteArray())
+                }
+            }
         }
+    }
+
+    private fun echo(c: Map<String, Any?>, headers: Map<String, String>): Map<String, Any?> {
+        val out = LinkedHashMap(c)
+        val fromHost = hostDerivedFields(c)
+        for (f in fromHost) {
+            out[f] = when (f) {
+                "upload_level" -> headers["X-Rtv-Upload-Level"]
+                "local_level" -> headers["X-Rtv-Local-Level"]
+                "local_cap_bytes" -> headers["X-Rtv-Local-Cap-Bytes"]?.toLong()
+                else -> headers["X-Rtv-Daily-Batch-Cap"]?.toLong()
+            }
+        }
+        out["from_host"] = fromHost
+        return out
     }
 
     override fun cancelAll() {
@@ -303,9 +336,14 @@ internal class FakePlatform : Platform {
 
     override fun availableBytes(dir: File): Long? = available
 
-    override fun scheduleUploadJob(jobId: Int) {
+    /** 返回值：false = 同 id 被别人占着（测试可设）。 */
+    @Volatile
+    var scheduleResult = true
+
+    override fun scheduleUploadJob(jobId: Int): Boolean {
         scheduleThreads.add(Thread.currentThread().name)
         scheduledJobs.add(jobId)
+        return scheduleResult
     }
 
     override fun cancelUploadJob(jobId: Int) {
@@ -335,11 +373,13 @@ internal class Harness(
     val transport: FakeTransport = FakeTransport(),
     val platform: FakePlatform = FakePlatform(),
     initialEnabled: Boolean? = null,
+    initialUser: String? = null,
 ) {
     val root: File = root ?: tempDir()
     val errors = CopyOnWriteArrayList<Throwable>()
-    val client: RetrieverClient = RetrieverClient(this.root, key, BASE, options, clock, transport, platform, initialEnabled).also { c ->
+    val client: RetrieverClient = RetrieverClient(this.root, key, BASE, options, clock, transport, platform, initialEnabled, initialUser).also { c ->
         c.onInternalError = { t -> errors.add(t) }
+        c.start()
     }
 
     init {
@@ -373,7 +413,7 @@ internal class Harness(
     }
 
     fun enableUpload(key: String = "lk_test_demo_abc_12345678", options: Options = Options()) {
-        client.reconfigure(key, BASE, options)
+        client.reconfigure(key, BASE, options, client.processName)
         settle()
     }
 
@@ -459,13 +499,23 @@ internal class Harness(
     }
 }
 
-/** 所有用例的基类：结束时关掉实例、断言无内部异常。 */
+/** 所有用例的基类：开始前清空静态入口的进程内状态；结束时关掉实例、断言无内部异常。 */
 abstract class RtvTest {
     open val expectInternalErrors: Boolean = false
 
+    @Before
+    fun resetStatics() {
+        Retriever.resetForTesting(null)
+        StaticHarness.STATIC_LIVE.clear()
+    }
+
     @After
     fun closeHarnesses() {
+        Retriever.resetForTesting(null)
+        org.revdog.retriever.core.TestHooks.adoption = null
+        org.revdog.retriever.core.Fs.writeAtomicFaultForTesting = null
         Harness.closeAll(expectInternalErrors)
+        if (expectInternalErrors) StaticHarness.STATIC_LIVE.clear() else StaticHarness.assertNoErrors()
     }
 }
 
@@ -502,3 +552,117 @@ internal fun runValidator(envs: List<Env>): List<Map<String, Any?>> {
 fun assertAllValid(results: List<Map<String, Any?>>) {
     for (r in results) assertEquals("$r", true, r["ok"])
 }
+
+// ---------------------------------------------------------------- packages/core hostDerivedFields 的移植（回显模式与 golden 回放用）
+
+private val LEVELS = setOf("debug", "info", "warn", "error", "fatal")
+
+/** `raw` 交给 clampConfig 时取宿主回落的宿主型字段（顺序固定；ADR 0022）。 */
+fun hostDerivedFields(raw: Any?): List<String> {
+    @Suppress("UNCHECKED_CAST")
+    val r = (raw as? Map<String, Any?>) ?: emptyMap()
+    return listOf("upload_level", "local_level", "local_cap_bytes", "daily_batch_cap").filter { f ->
+        val v = r[f]
+        if (f == "upload_level" || f == "local_level") v !in LEVELS else !(v is Double && !v.isNaN() && !v.isInfinite()) && !(v is Int || v is Long)
+    }
+}
+
+// ---------------------------------------------------------------- 静态入口夹具（简报 §0：新行为在 Retriever.* 层面测）
+
+/**
+ * 静态入口测试：把 [Retriever] 的平台环境换成临时目录 + 假时钟 + 假传输 + 假平台（`noContext` = 模拟拿不到 context 的进程）。
+ * 每个用例开始前 RtvTest 已清空静态状态；[restart] 模拟进程重启（实例不收尾地关掉、pre 文件放锁不删）。
+ */
+internal class StaticHarness(
+    val root: File = tempDir(),
+    val clock: FakeClock = FakeClock(),
+    val transport: FakeTransport = FakeTransport(),
+    val platform: FakePlatform = FakePlatform(),
+    noContext: Boolean = false,
+) {
+    val errors = CopyOnWriteArrayList<Throwable>()
+
+    init {
+        Retriever.resetForTesting(env(noContext))
+        Retriever.internalErrorSink = { errors.add(it) }
+        STATIC_LIVE.add(this)
+    }
+
+    fun env(noContext: Boolean = false): Retriever.Env = Retriever.Env(if (noContext) null else root, platform, clock) { transport }
+
+    val client: RetrieverClient get() = Retriever.currentClient() ?: error("还没有实例")
+
+    fun configure(key: String? = "", options: Options? = Options()) {
+        Retriever.configure(null, key, Harness.BASE, options)
+    }
+
+    fun settle() {
+        Retriever.currentClient()?.settle()
+    }
+
+    fun log(level: LogLevel, msg: String, attrs: Map<String, Any?>? = null, error: Throwable? = null) {
+        Retriever.log(level, msg, "t", attrs, error)
+    }
+
+    /** 模拟进程重启：实例不收尾地停掉、静态状态清空（pre 文件放锁不删），之后用同一个 root。 */
+    fun restart(transport: FakeTransport = this.transport): StaticHarness {
+        Retriever.currentClient()?.simulateCrash()
+        return StaticHarness(root, clock, transport, platform)
+    }
+
+    val preFiles: List<File> get() = (File(root, "pre").listFiles()?.toList() ?: emptyList()).filter { it.name.endsWith(".jsonl") }.sortedBy { it.name }
+
+    val outbox: File get() = File(root, "outbox")
+
+    fun outboxFiles(prefix: String? = null): List<String> =
+        (outbox.list()?.toList() ?: emptyList()).filter { it.endsWith(".gz") && (prefix == null || it.startsWith(prefix)) }.sorted()
+
+    fun envelopes(prefix: String? = null): List<Env> = outboxFiles(prefix).mapNotNull { n -> Env.ofGzip(n, File(outbox, n).readBytes()) }
+
+    fun readJsonl(name: String): List<Map<String, Any?>> {
+        val f = File(root, name)
+        if (!f.exists()) return emptyList()
+        return f.readText().split("\n").filter { it.isNotEmpty() }.mapNotNull { JsonIn.obj(it) }
+    }
+
+    fun currentSessionDir(): File = File(File(root, "proc-${client.processName}"), client.writer.currentSessionId)
+
+    /** 本进程名下全部会话目录（含当前）。 */
+    fun sessionDirs(proc: String = "main"): List<File> = (File(root, "proc-$proc").listFiles()?.toList() ?: emptyList()).filter { it.isDirectory }
+
+    companion object {
+        val STATIC_LIVE = CopyOnWriteArrayList<StaticHarness>()
+
+        fun assertNoErrors() {
+            val all = ArrayList(STATIC_LIVE)
+            STATIC_LIVE.clear()
+            val errs = all.flatMap { it.errors }
+            for (h in all) h.root.deleteRecursively()
+            if (errs.isNotEmpty()) {
+                val sw = StringWriter()
+                errs.first().printStackTrace(PrintWriter(sw))
+                fail("内部异常 ${errs.size} 个：$sw")
+            }
+        }
+    }
+}
+
+/** 一个会话目录里全部段的行（按段号，跳过段头），每行附原始字节。 */
+internal class SegLineRec(val map: Map<String, Any?>, val raw: String) {
+    operator fun get(k: String): Any? = map[k]
+}
+
+internal fun sessionLines(dir: File): List<SegLineRec> {
+    val out = ArrayList<SegLineRec>()
+    val segs = (dir.list() ?: emptyArray()).filter { it.startsWith("seg-") }
+        .sortedWith(compareBy<String>({ it.substring(4, 10).toInt() }, { if (it.endsWith(".open")) 1 else 0 }))
+    for (n in segs) {
+        val ls = File(dir, n).readText().split("\n").filter { it.isNotEmpty() }
+        for ((i, l) in ls.withIndex()) if (i > 0) JsonIn.obj(l)?.let { out.add(SegLineRec(it, l)) }
+    }
+    return out
+}
+
+internal fun segHeaders(dir: File): List<Map<String, Any?>> =
+    (dir.list() ?: emptyArray()).filter { it.startsWith("seg-") }.sortedBy { it.substring(4, 10).toInt() }
+        .mapNotNull { n -> File(dir, n).readText().split("\n").firstOrNull()?.let { JsonIn.obj(it) } }

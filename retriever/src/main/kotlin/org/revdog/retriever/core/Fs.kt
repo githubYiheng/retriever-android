@@ -43,6 +43,35 @@ internal object Fs {
         null
     }
 
+    /** 读的结果：读到 / 确实不存在（ENOENT）/ 读失败（其它错误：权限、I/O、是目录……）。 */
+    sealed class ReadResult {
+        class Ok(val bytes: ByteArray) : ReadResult()
+
+        object Missing : ReadResult()
+
+        object Failed : ReadResult()
+    }
+
+    /**
+     * 区分「不存在」与「读失败」（ADR 0024 决定 3：读失败 ≠ 没有内容）。`FileInputStream` 对 ENOENT 与 EACCES 抛同一种异常，
+     * `exists()` 对 stat 错误也返回 false——所以「不存在」还要求父目录列得出且不含它。
+     */
+    fun readResult(f: File): ReadResult = try {
+        ReadResult.Ok(f.readBytes())
+    } catch (e: IOException) {
+        if (isMissing(f)) ReadResult.Missing else ReadResult.Failed
+    } catch (e: SecurityException) {
+        ReadResult.Failed
+    }
+
+    /** 确实不存在：父目录列得出且不含它；父目录本身也确实不存在（root 整个被删）同样算。列不出（权限 / I/O）= 不知道 → false。 */
+    fun isMissing(f: File): Boolean {
+        if (f.exists()) return false
+        val p = f.parentFile ?: return false
+        val names = p.list() ?: return isMissing(p)
+        return f.name !in names
+    }
+
     fun size(f: File): Long? = if (f.exists()) f.length() else null
 
     fun mtimeMs(f: File): Long? = if (f.exists()) f.lastModified() else null
@@ -51,8 +80,13 @@ internal object Fs {
         f.setLastModified(maxOf(wallMs, 0))
     }
 
+    /** 测试注入点：非 null 且对该文件返回 true 时 [writeAtomic] 直接失败（模拟 meta.json 写不进）。生产恒为 null。 */
+    @Volatile
+    var writeAtomicFaultForTesting: ((File) -> Boolean)? = null
+
     /** 原子写：同目录 tmp → write → sync → rename；失败不留半成品。 */
     fun writeAtomic(f: File, bytes: ByteArray): Boolean {
+        if (writeAtomicFaultForTesting?.invoke(f) == true) return false
         val tmp = File(f.parentFile, ".${f.name}.tmp-${Ids.newV4()}")
         try {
             FileOutputStream(tmp).use { out ->
@@ -128,22 +162,28 @@ internal class RootLocks(private val root: File) {
         }
     }
 
-    fun <T> withDirLock(body: () -> T): T {
-        if (jvmLock.isHeldByCurrentThread) return body()
+    /**
+     * 在根级读改写锁内执行 [body]。锁拿不到（`upload.lock` 打不开、fd 耗尽、加锁出错）时**不执行**、返回 null——
+     * 按本次失败处理、稍后重试（ADR 0024 决定 3），绝不不加锁执行。同线程重入直接执行。
+     */
+    fun <T> withDirLock(body: () -> T): T? {
+        if (jvmLock.isHeldByCurrentThread && heldByMe) return body()
         jvmLock.lock()
         try {
-            val fl: FileLock? = try {
+            val fl: FileLock = try {
                 channel()?.lock(1, 1, false)
             } catch (e: IOException) {
                 null
             } catch (e: OverlappingFileLockException) {
                 null
-            }
+            } ?: return null
+            heldByMe = true
             try {
                 return body()
             } finally {
+                heldByMe = false
                 try {
-                    fl?.release()
+                    fl.release()
                 } catch (e: IOException) {
                     // 释放失败：channel 关闭时内核一并释放
                 }
@@ -152,6 +192,9 @@ internal class RootLocks(private val root: File) {
             jvmLock.unlock()
         }
     }
+
+    /** 当前线程已在 [withDirLock] 的锁内（文件锁已拿到）；只在持 [jvmLock] 时读写。 */
+    private var heldByMe = false
 
     fun tryUploadLock(): Boolean {
         if (uploadLock != null) return true
@@ -195,8 +238,10 @@ internal class RootLocks(private val root: File) {
 }
 
 /**
- * 会话目录锁（iOS 用会话目录 fd 上的 flock）：锁住 `<session>/meta.json`。进程存活期间一直持有，进程死亡由内核释放；
- * 恢复流程拿不到某个旧会话的锁 = 该会话还活着（别的进程 / 同进程另一实例），跳过不动。
+ * 会话目录锁（iOS 用会话目录 fd 上的 flock）：锁住会话目录下的专用文件 `lock`（0.3.0 起；只建不读不重写，任何代码都不得另开它——
+ * 同一进程里开再关同一文件的任何 fd 都会释放本进程在它上面的 fcntl 锁，原先锁在会被重写 / 被读的 meta.json 上就踩了这个坑）。
+ * 进程存活期间一直持有，进程死亡由内核释放；恢复流程拿不到某个旧会话的锁 = 该会话还活着（别的进程 / 同进程另一实例），跳过不动。
+ * bootstrap 先建锁再写 meta.json：有 meta 却没有 `lock` 的会话只能是旧版本（0.2.x）留下的，恢复时建它并加锁（拿得到 = 死会话）。
  */
 internal class SessionLock private constructor(private val raf: RandomAccessFile, private val lock: FileLock) {
     fun release() {
@@ -213,12 +258,16 @@ internal class SessionLock private constructor(private val raf: RandomAccessFile
     }
 
     companion object {
-        /** 拿不到（被占用）返回 null；文件不存在也返回 null（不创建）。 */
-        fun tryAcquire(meta: File): SessionLock? {
-            if (!meta.isFile) return null
+        const val FILE = "lock"
+
+        /** 会话目录 [dir] 的锁：拿不到（被占用 / 打不开）返回 null。`lock` 文件不存在时创建（目录不存在则失败）。 */
+        fun tryAcquire(dir: File): SessionLock? {
+            if (!dir.isDirectory) return null
             val raf = try {
-                RandomAccessFile(meta, "rw")
+                RandomAccessFile(File(dir, FILE), "rw")
             } catch (e: IOException) {
+                return null
+            } catch (e: SecurityException) {
                 return null
             }
             val fl = try {

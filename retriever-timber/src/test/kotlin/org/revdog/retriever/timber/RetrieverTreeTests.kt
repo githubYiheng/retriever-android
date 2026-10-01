@@ -91,6 +91,17 @@ class RetrieverTreeTests {
         assertNull("没设 tag 的调用不沿用上一个", calls[1].tag)
     }
 
+    /** 落点 / 宿主异常抛任何 Throwable 都不抛进宿主的 Timber 调用（ADR 0024 决定 5）。 */
+    @Test
+    fun neverThrows() {
+        val t = RetrieverTree({ _, _, _, _ -> throw AssertionError("sink") }, { LogLevel.DEBUG })
+        t.log(Log.ERROR, "tag", "msg", null)
+        val evil = object : RuntimeException("x") {
+            override fun printStackTrace(s: java.io.PrintWriter) = throw IllegalStateException("printStackTrace")
+        }
+        RetrieverTree({ _, _, _, _ -> }, { LogLevel.DEBUG }).log(Log.ERROR, "tag", "msg", evil)
+    }
+
     @Test
     fun unmatchedSuffixKeptAsIs() {
         // message 不是 Timber 拼出来的形状（例如子类改写了 prepareLog）：原样保留，异常照样进 exc

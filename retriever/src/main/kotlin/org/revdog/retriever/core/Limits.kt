@@ -84,6 +84,21 @@ internal object ClientConstants {
     /** §3.9 传输连接 / 读超时。 */
     const val REQUEST_TIMEOUT_MS = 30_000
 
+    /** fatal 强制换段的节流窗口（ADR 0024 决定 8）：窗口内第一条立即换段，其后 10 s 内的 fatal 并入 error 去抖。 */
+    const val FATAL_SEAL_WINDOW_MS = 10_000L
+
+    /** 段读失败 / 禁用标记判定未知时的重试间隔（同 [MARKER_RETRY_MS]）。 */
+    const val RETRY_MS = 60_000L
+
+    /** 收编没做完（pre 文件读失败、unlink 与截断都失败）、bootstrap 没成的重试间隔 5 s（两端同值；定时器唤醒，不靠宿主再写一行）。 */
+    const val ADOPT_RETRY_MS = 5_000L
+
+    /** attrs 里集合 / 数组 / map 渲染成 JSON 文本时的最大嵌套深度（超出 = 占位串）。 */
+    const val ATTR_RENDER_MAX_DEPTH = 8
+
+    /** attrs 值求值出错（toString / toDouble 抛异常、循环引用、并发修改）时写的占位串（标 truncated）。 */
+    const val UNPRINTABLE = "<unprintable>"
+
     /** §3.1 stack 超长时中间插入的标记。 */
     const val STACK_MARKER = "\n…[truncated]…\n"
     const val DAY_MS = 24L * 60 * 60 * 1000

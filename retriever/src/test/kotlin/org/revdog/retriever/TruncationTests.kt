@@ -115,7 +115,8 @@ class TruncationTests {
         assertEquals("NaN", a2["nan"])
         assertEquals("-Infinity", a2["n"])
         assertEquals(42.0, a2["l"])
-        assertEquals("[1, 2]", a2["obj"])
+        // 集合渲染成紧凑 JSON 文本（0.3.0：原先是 toString 的 "[1, 2]"；简报 §5）
+        assertEquals("[1,2]", a2["obj"])
         // Java map 里的 null 键跳过（标 truncated），其它键照常
         @Suppress("UNCHECKED_CAST")
         val withNullKey = (java.util.HashMap<String?, Any?>().apply { put(null, 1); put("ok", 2) } as Map<String, Any?>)

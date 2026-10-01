@@ -44,19 +44,18 @@ internal object AndroidClock : Clock {
 
 /**
  * Android 平台层（方案 §3.9 Android 列）：
- * - 生命周期：`registerActivityLifecycleCallbacks` 计数 started activities → 前台 / 后台（配置变更重建不算）；
+ * - 生命周期：进程级 [LifecycleTracker]（init provider 里注册，按 Activity 身份集合计数）→ 前台 / 后台（配置变更重建不算）；
  * - 网络：`registerDefaultNetworkCallback` 的 onAvailable 只用来提前唤醒（不做可达性预检）；
- * - 后台兜底：框架 JobScheduler 一次性作业（网络约束、持久化；ADR 0003 决定 13，不引 WorkManager）；`setEnabled(false)` 取消它；
+ * - 后台兜底：框架 JobScheduler 一次性作业（网络约束、持久化，缺开机权限退回非持久；ADR 0003 决定 13，不引 WorkManager），
+ *   只认 / 只取消自己的同号作业（[JobGate]）；`setEnabled(false)` 取消它；
  * - StrictMode：宿主线程上碰磁盘处放行磁盘读写与 unbuffered IO 并恢复；网络请求打 `TrafficStats` 标签（[TaggedTransport]）；
  * - 栈：`printStackTrace` 文本（[stackTraceText]，不用 `Log.getStackTraceString`）。
+ * configure 之前只用到它的进程名、设备字段与 StrictMode 放行（不注册任何监听）。
  */
-internal class AndroidPlatform(private val app: Context) : Platform {
+internal class AndroidPlatform(private val app: Context, private val tracker: LifecycleTracker = LifecycleTracker.shared) : Platform {
     @Volatile
     private var sink: PlatformEventSink? = null
     private var observing = false
-    private var started = 0
-    private var changing = 0
-    private var foreground: Boolean? = null
     private var hadNetwork: Boolean? = null
 
     override fun deviceFields(): Map<String, String> {
@@ -88,12 +87,16 @@ internal class AndroidPlatform(private val app: Context) : Platform {
         )
     }
 
-    /** 进程重要性：前台 / 可见 = fg；其余（被作业、广播拉起的后台进程）= bg。之后以 Activity 回调为准。 */
-    override fun isForeground(): Boolean {
+    /** 前后台：tracker 已注册取它的状态；否则取进程重要性（前台 / 可见 = fg；被作业、广播拉起的后台进程 = bg）。 */
+    override fun isForeground(): Boolean = tracker.current() ?: importanceForeground()
+
+    private fun importanceForeground(): Boolean = try {
         val info = ActivityManager.RunningAppProcessInfo()
         ActivityManager.getMyMemoryState(info)
-        return info.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND ||
+        info.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND ||
             info.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE
+    } catch (e: RuntimeException) {
+        false
     }
 
     override fun autoProcessName(): String {
@@ -115,13 +118,17 @@ internal class AndroidPlatform(private val app: Context) : Platform {
         null
     }
 
+    /**
+     * 实例创建时：订阅 tracker（provider 已注册时状态从进程一开始就对；没注册且 context 是 Application → 现在注册，初值取进程重要性；
+     * context 不是 Application（`attachBaseContext` 里传 base）→ 等 provider 稍后给出 Application 时由 tracker 补注册）。
+     */
     @Synchronized
     override fun startObserving(sink: PlatformEventSink) {
         this.sink = sink
+        tracker.subscribe(sink)
         if (observing) return
         observing = true
-        foreground = isForeground()
-        (app as? Application)?.registerActivityLifecycleCallbacks(lifecycle)
+        (app as? Application)?.let { a -> tracker.install(a, false) { importanceForeground() } }
         try {
             val cm = app.getSystemService(ConnectivityManager::class.java)
             if (cm != null) {
@@ -136,58 +143,11 @@ internal class AndroidPlatform(private val app: Context) : Platform {
     @Synchronized
     override fun stopObserving(sink: PlatformEventSink) {
         if (this.sink === sink) this.sink = null
+        tracker.unsubscribe(sink)
     }
 
     private fun post(e: PlatformEvent) {
         sink?.platformEvent(e)
-    }
-
-    private val lifecycle = object : Application.ActivityLifecycleCallbacks {
-        override fun onActivityStarted(activity: Activity) {
-            val fire = synchronized(this@AndroidPlatform) {
-                if (changing > 0) {
-                    changing -= 1
-                    started += 1
-                    false
-                } else {
-                    started += 1
-                    if (foreground != true) {
-                        foreground = true
-                        true
-                    } else {
-                        false
-                    }
-                }
-            }
-            if (fire) post(PlatformEvent.WILL_ENTER_FOREGROUND)
-        }
-
-        override fun onActivityStopped(activity: Activity) {
-            val fire = synchronized(this@AndroidPlatform) {
-                started = maxOf(0, started - 1)
-                if (activity.isChangingConfigurations) {
-                    // 旋转等配置变更：马上会重建并 onStart，不算进后台
-                    changing += 1
-                    false
-                } else if (started == 0 && foreground != false) {
-                    foreground = false
-                    true
-                } else {
-                    false
-                }
-            }
-            if (fire) post(PlatformEvent.DID_ENTER_BACKGROUND)
-        }
-
-        override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
-
-        override fun onActivityResumed(activity: Activity) = Unit
-
-        override fun onActivityPaused(activity: Activity) = Unit
-
-        override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
-
-        override fun onActivityDestroyed(activity: Activity) = Unit
     }
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -223,24 +183,36 @@ internal class AndroidPlatform(private val app: Context) : Platform {
         return if (v > 0) v else null
     }
 
-    override fun scheduleUploadJob(jobId: Int) {
-        try {
-            val js = app.getSystemService(JobScheduler::class.java) ?: return
-            // 已有同 id 作业在排 / 在跑：不动（schedule 同 id 会停掉正在跑的那个）
-            if (js.getPendingJob(jobId) != null) return
-            val info = JobInfo.Builder(jobId, ComponentName(app, RetrieverUploadJobService::class.java))
-                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
-                .setPersisted(true)
-                .build()
-            js.schedule(info)
-        } catch (e: RuntimeException) {
-            // 绝不抛给宿主（作业数超限、manifest 被裁掉等）
+    private val jobs = JobGate(object : JobApi {
+        override fun pendingService(id: Int): String? {
+            val js = app.getSystemService(JobScheduler::class.java) ?: return null
+            val p = js.getPendingJob(id) ?: return null
+            return p.service?.className ?: ""
         }
+
+        override fun schedule(id: Int, persisted: Boolean): Boolean {
+            val js = app.getSystemService(JobScheduler::class.java) ?: return false
+            val b = JobInfo.Builder(id, ComponentName(app, RetrieverUploadJobService::class.java))
+                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+            if (persisted) b.setPersisted(true)
+            return js.schedule(b.build()) == JobScheduler.RESULT_SUCCESS
+        }
+
+        override fun cancel(id: Int) {
+            app.getSystemService(JobScheduler::class.java)?.cancel(id)
+        }
+    }, RetrieverUploadJobService::class.java.name)
+
+    override fun scheduleUploadJob(jobId: Int): Boolean = try {
+        jobs.schedule(jobId)
+    } catch (e: RuntimeException) {
+        // 绝不抛给宿主（作业数超限、manifest 被裁掉等）
+        false
     }
 
     override fun cancelUploadJob(jobId: Int) {
         try {
-            app.getSystemService(JobScheduler::class.java)?.cancel(jobId)
+            jobs.cancel(jobId)
         } catch (e: RuntimeException) {
             // 绝不抛给宿主
         }

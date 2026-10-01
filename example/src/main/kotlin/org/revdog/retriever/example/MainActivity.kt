@@ -39,6 +39,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        appContext = applicationContext
         setContentView(buildContentView())
         if (savedInstanceState == null) ScenarioRunner.runIfRequested(intent?.getStringExtra(EXTRA_SCENARIO))
     }
@@ -51,6 +52,12 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        if (ExampleApp.lateConfigurePending) {
+            // late_configure：Activity 已 onStart / onResume 之后才 configure——会话的初始前后台应是前台（进程级 tracker 从 provider 起就在记）
+            ExampleApp.lateConfigurePending = false
+            ExampleApp.configureNow(application)
+            Retriever.log(LogLevel.WARN, "scenario ${ScenarioRunner.LATE_CONFIGURE} done", "scenario")
+        }
         main.post(refresher)
     }
 
@@ -157,5 +164,9 @@ class MainActivity : Activity() {
 
     companion object {
         const val EXTRA_SCENARIO = "scenario"
+
+        /** 场景用（记一次性标记）：Application context。 */
+        @Volatile
+        var appContext: android.content.Context? = null
     }
 }

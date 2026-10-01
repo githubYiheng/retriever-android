@@ -172,7 +172,8 @@ internal fun Engine.split413(name: String): Boolean {
     val ls = ArrayList<SplitLine>()
     for (raw in p.lines) {
         val pre = Segments.parsePrefix(raw, 0, raw.size) ?: continue
-        ls.add(SplitLine(raw, pre.seq, pre.oseq, pre.ts, pre.levelRank, Bytes.contains(CTX_MARK, raw)))
+        // 是否 ctx 按行尾固定位置判断（ADR 0024 决定 9），attrs 里的 `ctx` 键不算
+        ls.add(SplitLine(raw, pre.seq, pre.oseq, pre.ts, pre.levelRank, Segments.isCtxLine(raw, 0, raw.size)))
     }
     val oblig = ls.filter { !it.ctx && it.oseq > 0 }
     val ctx = ls.filter { it.ctx }.toMutableList()
@@ -244,12 +245,14 @@ private fun Engine.rollbackSplit(written: List<String>, original: String) {
 private class EvSeg(val file: File, val size: Long, val mtime: Long, val segNo: Int)
 
 /**
- * 总量 = 各会话段 + 出站箱；两个额度（ADR 0010）：硬上限 = local_cap_bytes，是驱逐义务批的唯一依据；
+ * 总量 = 各会话段 + 出站箱 + pre 文件（ADR 0023：configure 之前的行也计入本地总量，R-5）；两个额度（ADR 0010）：硬上限 = local_cap_bytes，是驱逐义务批的唯一依据；
  * 余量额度 = min(硬上限, 本方已占 + 可用空间 − 64 MB)（可用空间未知时 = 硬上限），只约束无义务类（RETAINED 段、p2）。
  * 顺序：RETAINED 段最旧优先（无义务不记墓碑；> 7 d 无条件删）→ p2（backfill_evicted）→（超硬上限时）q（quarantine_evicted）
  * → p1（buffer_overflow）→ p0（buffer_overflow）。当前 OPEN 段永不驱逐。
  */
 internal fun Engine.evictIfNeeded() {
+    // 恢复旧会话成功完成之前一律不驱逐：旧会话还没登记，它们的段被删时既不物化也不记墓碑（静默丢）。恢复被跳过的定时重试
+    if (!recovered) return
     val nowWall = clock.wallMs()
     val sealed = ArrayList<EvSeg>()
     var total = 0L
@@ -268,6 +271,22 @@ internal fun Engine.evictIfNeeded() {
             }
         }
     }
+    // pre 文件：计入总量；不属于任何活进程（flock 拿得到）且 mtime 超过 7 天的删掉（收编不了的孤儿，例如被别的进程名下的会话认领）。
+    // 本进程正开着的（收编中）与别的活进程的不碰
+    for (n in Fs.list(preDir)) {
+        if (!n.endsWith(PreFile.SUFFIX)) continue
+        val f = File(preDir, n)
+        val size = Fs.size(f) ?: 0
+        if (nowWall - (Fs.mtimeMs(f) ?: nowWall) > Limits.RING_MAX_AGE_DAYS * ClientConstants.DAY_MS) {
+            val orphan = OrphanPre.tryAcquire(f)
+            if (orphan != null) {
+                f.delete()
+                orphan.release()
+                continue
+            }
+        }
+        total += size
+    }
     reconcileOutbox()
     for (m in metas.values) total += m.bytes
 
@@ -276,19 +295,17 @@ internal fun Engine.evictIfNeeded() {
     // 低磁盘只让出可再生的部分：义务批不能因余量不足在上传前消失（否则墓碑也永远送不出去）
     val softCap = if (avail != null) minOf(hardCap, maxOf(0, total + avail - ClientConstants.DISK_RESERVE_BYTES)) else hardCap
     sealed.sortWith(compareBy<EvSeg>({ it.mtime }, { it.segNo }))
-    val tombs = ArrayList<DropEntry>()
     val maxAge = Limits.RING_MAX_AGE_DAYS * ClientConstants.DAY_MS
     val remaining = ArrayList<EvSeg>()
     for (s in sealed) {
         if (nowWall - s.mtime > maxAge) {
-            total -= s.size
-            evictSegment(s.file, nowWall, tombs)
+            if (evictSegment(s.file, nowWall)) total -= s.size
         } else {
             remaining.add(s)
         }
     }
     val cur = current
-    if (total > softCap && cur != null && (cur.sealed.lastOrNull()?.lastOseq ?: 0) > cur.cursor.extractedThroughOseq) {
+    if (total > softCap && cur != null && !writer.isAdopting && (cur.sealed.lastOrNull()?.lastOseq ?: 0) > cur.cursor.extractedThroughOseq) {
         // daily cap 推迟的义务行先物化，保证 RETAINED 段不带义务
         materialize(cur, cur.sealed.maxOfOrNull { it.lastOseq } ?: 0, cur.sealed.lastOrNull()?.lastSeq ?: 0, false, true)
         reconcileOutbox()
@@ -297,8 +314,7 @@ internal fun Engine.evictIfNeeded() {
     }
     for (s in remaining) {
         if (total <= softCap) break
-        total -= s.size
-        evictSegment(s.file, nowWall, tombs)
+        if (evictSegment(s.file, nowWall)) total -= s.size
     }
     if (total > softCap) {
         for (prio in intArrayOf(2, 3, 1, 0)) {
@@ -308,33 +324,28 @@ internal fun Engine.evictIfNeeded() {
                 .sortedWith(compareBy<BatchMeta>({ it.createdMs }, { it.name }))
             for (m in batch) {
                 if (total <= cap) break
-                total -= m.bytes
-                evictBatch(m, nowWall, tombs)
+                if (evictBatch(m, nowWall)) total -= m.bytes
             }
         }
     }
-    if (tombs.isNotEmpty()) appendDrops(tombs)
 }
 
-private fun Engine.evictSegment(file: File, now: Long, tombs: MutableList<DropEntry>) {
+/** 驱逐一个段：有没物化的义务行先记墓碑，记成了再删；墓碑写不成本轮不驱逐它（返回 false）。 */
+private fun Engine.evictSegment(file: File, now: Long): Boolean {
     for (s in ownSessions) {
         val idx = s.sealed.indexOfFirst { it.file.path == file.path }
         if (idx < 0) continue
         val info = s.sealed[idx]
         if (info.obligCount > 0 && info.lastOseq > s.cursor.extractedThroughOseq) {
             val from = maxOf(info.firstOseq, s.cursor.extractedThroughOseq + 1)
-            tombs.add(
-                DropEntry(
-                    s.meta.sessionId, from, info.lastOseq, info.lastOseq - from + 1, DropReason.BUFFER_OVERFLOW, now,
-                    lastAckAge(now),
-                ),
-            )
+            val t = DropEntry(s.meta.sessionId, from, info.lastOseq, info.lastOseq - from + 1, DropReason.BUFFER_OVERFLOW, now, lastAckAge(now))
+            if (!appendDrops(listOf(t))) return false
         }
         s.sealed.removeAt(idx)
         if (s !== current && s.sealed.isEmpty() && s.cursor.closedMs != null) {
             others.remove(s.meta.sessionId)
             Fs.remove(s.dir)
-            return
+            return true
         }
         // seq 高水位：被驱逐段的行不可能再作 ctx，把它的 lastSeq 并入 ctx 游标语义正确，又不改磁盘格式；
         // 恢复时 maxSeq 取 max(盘上, ctx_through_seq)，旧段全被驱逐后合成行的 seq 也不会回退撞号
@@ -346,15 +357,29 @@ private fun Engine.evictSegment(file: File, now: Long, tombs: MutableList<DropEn
     }
     Fs.remove(file)
     // 别的进程 / 已关闭会话的目录空了就一并清掉
-    val dir = file.parentFile ?: return
+    val dir = file.parentFile ?: return true
     if (Fs.list(dir).none { Segments.parseName(it) != null } &&
         dir.path != current?.dir?.path && others[dir.name] == null && dir.parentFile?.path != procDir.path
     ) {
         Fs.remove(dir)
     }
+    return true
 }
 
-private fun Engine.evictBatch(m: BatchMeta, now: Long, tombs: MutableList<DropEntry>) {
+/** 驱逐一个批：先记墓碑（义务批 / backfill），记成了再删；墓碑写不成本轮不驱逐它（返回 false）。 */
+private fun Engine.evictBatch(m: BatchMeta, now: Long): Boolean {
+    if (m.sessionId.isNotEmpty()) {
+        val age = lastAckAge(now)
+        val t = if (m.kind == Ids.BatchKind.BACKFILL) {
+            DropEntry(m.sessionId, 0, 0, maxOf(m.lineCount, 1).toLong(), DropReason.BACKFILL_EVICTED, now, age)
+        } else if (m.oseqFrom > 0) {
+            val reason = if (m.prio == 3) DropReason.QUARANTINE_EVICTED else DropReason.BUFFER_OVERFLOW
+            DropEntry(m.sessionId, m.oseqFrom, m.oseqTo, m.oseqTo - m.oseqFrom + 1, reason, now, age)
+        } else {
+            null
+        }
+        if (t != null && !appendDrops(listOf(t))) return false
+    }
     Fs.remove(File(outboxDir, m.name))
     metas.remove(m.name)
     fails.remove(m.name)
@@ -363,12 +388,5 @@ private fun Engine.evictBatch(m: BatchMeta, now: Long, tombs: MutableList<DropEn
     embeddedClosed.removeAll(m.closed.map { it.sessionId }.toSet())
     val p = pendingMapping
     if (m.hasMapping && p != null && p.user == m.mappingUser && p.digest == m.mappingDigest) pendingMapping = null
-    if (m.sessionId.isEmpty()) return
-    val age = lastAckAge(now)
-    if (m.kind == Ids.BatchKind.BACKFILL) {
-        tombs.add(DropEntry(m.sessionId, 0, 0, maxOf(m.lineCount, 1).toLong(), DropReason.BACKFILL_EVICTED, now, age))
-    } else if (m.oseqFrom > 0) {
-        val reason = if (m.prio == 3) DropReason.QUARANTINE_EVICTED else DropReason.BUFFER_OVERFLOW
-        tombs.add(DropEntry(m.sessionId, m.oseqFrom, m.oseqTo, m.oseqTo - m.oseqFrom + 1, reason, now, age))
-    }
+    return true
 }

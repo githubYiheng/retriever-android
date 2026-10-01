@@ -64,10 +64,13 @@ internal interface Platform {
     /** 可用磁盘空间（null = 未知，不按空间收缩上限）。 */
     fun availableBytes(dir: File): Long?
 
-    /** 排一个一次性后台上传作业（JobScheduler：网络约束、持久化）。已有同 id 作业在排 / 在跑则不动。 */
-    fun scheduleUploadJob(jobId: Int)
+    /**
+     * 排一个一次性后台上传作业（JobScheduler：网络约束、持久化；缺开机权限退回非持久）。同 id 已有**我们自己的**作业在排 / 在跑
+     * 则不动；同 id 是别人的作业一律不碰（ADR 0024 决定 11）。返回 false = 没排上（别人占了这个 id、或系统拒绝），调用方记一次诊断。
+     */
+    fun scheduleUploadJob(jobId: Int): Boolean
 
-    /** 取消排着的后台上传作业（`setEnabled(false)`，ADR 0020 决定 2）。 */
+    /** 取消排着的后台上传作业（`setEnabled(false)`，ADR 0020 决定 2）——只取消我们自己的。 */
     fun cancelUploadJob(jobId: Int)
 
     /** Throwable → 栈文本（Android：[stackTraceText]）。 */
@@ -90,9 +93,7 @@ internal fun stackTraceText(t: Throwable): String = try {
     t.printStackTrace(pw)
     pw.flush()
     sw.toString()
-} catch (e: Exception) {
-    ""
-} catch (e: StackOverflowError) {
+} catch (e: Throwable) {
     ""
 }
 

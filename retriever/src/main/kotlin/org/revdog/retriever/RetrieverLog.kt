@@ -48,17 +48,27 @@ public object RetrieverLog {
 
     /**
      * 先写 Retriever、再写 logcat（ADR 0020 决定 1）：`Log.wtf` 按系统配置可能直接终止进程，先写 logcat 的话那一行就进不了 Retriever。
-     * msg 为 null（Java 的 `e.getMessage()`）：logcat 照 `Log` 的习惯写 "null"；Retriever 里有异常取 `tr.toString()`。
+     * msg 为 null（Java 的 `e.getMessage()`）：logcat 照 `Log` 的习惯写 "null"；Retriever 里有异常取 `tr.toString()`
+     * （它抛异常 → 交给 Retriever 取占位串）。两个落点抛任何东西都不抛给宿主（ADR 0024 决定 5）。
      */
     private fun emit(priority: Int, level: LogLevel, tag: String?, msg: String?, tr: Throwable?): Int {
         try {
-            sink(level, if (msg.isNullOrEmpty() && tr != null) tr.toString() else msg ?: "", tag, tr)
-        } catch (e: RuntimeException) {
+            val m = if (msg.isNullOrEmpty() && tr != null) {
+                try {
+                    tr.toString()
+                } catch (t: Throwable) {
+                    null
+                }
+            } else {
+                msg ?: ""
+            }
+            sink(level, m ?: "<unprintable>", tag, tr)
+        } catch (e: Throwable) {
             // 绝不抛给宿主
         }
         return try {
             logcat(priority, tag, if (msg == null && tr != null) "" else msg.toString(), tr)
-        } catch (e: RuntimeException) {
+        } catch (e: Throwable) {
             0
         }
     }

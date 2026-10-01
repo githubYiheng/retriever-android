@@ -43,13 +43,20 @@ public data class LogLine(
     val exc: LogException?,
 )
 
-/** 宿主选项（§3.10；ADR 0004 / 0005）。可变属性 + 默认值，Java 友好。 */
+/**
+ * 宿主选项（§3.10；ADR 0004 / 0005）。可变属性 + 默认值，Java 友好。只在 `configure` 时读一次。
+ * 引用类型的 setter 接受 null（= 默认值；Java / 平台类型传 null 不抛，ADR 0024 决定 5）；Kotlin 照常用属性赋值。
+ */
 public class Options {
     /** 自动上传级别（ADR 0004）：该级别及以上的行是义务行（有 oseq）。远程配置可覆盖。 */
     public var uploadLevel: LogLevel = LogLevel.WARN
+        @JvmSynthetic @JvmName("uploadLevelKt")
+        set
 
     /** 本地落盘级别（§3.3-9）：以下的行不写、不占 seq。远程配置可覆盖。 */
     public var localLevel: LogLevel = LogLevel.DEBUG
+        @JvmSynthetic @JvmName("localLevelKt")
+        set
 
     /** 每日包数软上限（ADR 0005）；0 = 不限。远程配置可覆盖（钳制 0–10000）。 */
     public var dailyBatchCap: Int = 0
@@ -57,7 +64,10 @@ public class Options {
     /** 本地总量上限（宿主默认，远程可改，钳制 2–100 MB）。 */
     public var localCapBytes: Long = 20L * 1024 * 1024
 
-    /** 落盘前同步调用；返回 null = 丢弃（不占 seq、不记墓碑）。钩子内调 `log()` 视为重入直接忽略。 */
+    /**
+     * 落盘前同步调用；返回 null = 丢弃（不占 seq、不记墓碑）；抛异常 = 丢弃该行。钩子内调 `log()` 视为重入直接忽略。
+     * 不能改 `ts`（改了也取回原值）。configure 之前的行在收编时过它——可能在 SDK 线程上被调：须线程安全、要快。
+     */
     public var redact: ((LogLine) -> LogLine?)? = null
 
     /** 会话目录 `proc-<name>` 与信封 `process`；null = 自动：主进程 "main"，其它取进程名 `:` 之后的后缀。 */
@@ -68,9 +78,29 @@ public class Options {
 
     /** 进 `device.sdk = "retriever-android/<ver>"` 与 `X-Rtv-Sdk`。 */
     public var sdkVersion: String = RetrieverVersion.CURRENT
+        @JvmSynthetic @JvmName("sdkVersionKt")
+        set
+
+    /** Java 侧 setter：null = 默认 warn。 */
+    public fun setUploadLevel(level: LogLevel?) {
+        uploadLevel = level ?: LogLevel.WARN
+    }
+
+    /** Java 侧 setter：null = 默认 debug。 */
+    public fun setLocalLevel(level: LogLevel?) {
+        localLevel = level ?: LogLevel.DEBUG
+    }
+
+    /** Java 侧 setter：null = 默认（本 SDK 版本）。 */
+    public fun setSdkVersion(version: String?) {
+        sdkVersion = version ?: RetrieverVersion.CURRENT
+    }
 }
 
-/** `flush()` 的结果：`Stored` = flush 产生的批 15 s 内已被服务端确认；`Pending` 附原因（offline / backoff / paused / timeout / disabled）。 */
+/**
+ * `flush()` 的结果：`Stored` = flush 产生的批 15 s 内已被服务端确认；`Pending` 附原因（offline / backoff / paused / timeout / disabled；
+ * 未 configure = paused，等待中被禁用 = disabled）。
+ */
 public sealed class FlushResult {
     public data object Stored : FlushResult() {
         override fun toString(): String = "stored"
@@ -88,5 +118,5 @@ public fun interface FlushCallback {
 
 /** SDK 版本号（唯一来源）：进 `device.sdk = "retriever-android/<ver>"` 与 `X-Rtv-Sdk`；必须 == gradle.properties 的 VERSION_NAME。 */
 public object RetrieverVersion {
-    public const val CURRENT: String = "0.2.0"
+    public const val CURRENT: String = "0.3.0"
 }

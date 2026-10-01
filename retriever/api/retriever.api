@@ -78,11 +78,11 @@ package org.revdog.retriever {
     method @InaccessibleFromKotlin public void setDailyBatchCap(int);
     method @InaccessibleFromKotlin public void setJobId(int);
     method @InaccessibleFromKotlin public void setLocalCapBytes(long);
-    method @InaccessibleFromKotlin public void setLocalLevel(org.revdog.retriever.LogLevel);
+    method public void setLocalLevel(org.revdog.retriever.LogLevel? level);
     method @InaccessibleFromKotlin public void setProcessName(String?);
     method @InaccessibleFromKotlin public void setRedact(kotlin.jvm.functions.Function1<? super org.revdog.retriever.LogLine,org.revdog.retriever.LogLine?>?);
-    method @InaccessibleFromKotlin public void setSdkVersion(String);
-    method @InaccessibleFromKotlin public void setUploadLevel(org.revdog.retriever.LogLevel);
+    method public void setSdkVersion(String? version);
+    method public void setUploadLevel(org.revdog.retriever.LogLevel? level);
     property public int dailyBatchCap;
     property public int jobId;
     property public long localCapBytes;
@@ -94,22 +94,22 @@ package org.revdog.retriever {
   }
 
   public final class Retriever {
-    method public static void configure(android.content.Context context, String key);
-    method public static void configure(android.content.Context context, String key, optional String baseUrl);
-    method public static void configure(android.content.Context context, String key, optional String baseUrl, optional org.revdog.retriever.Options options);
-    method public static void flush(optional boolean includeContext, org.revdog.retriever.FlushCallback callback);
-    method public static void flush(org.revdog.retriever.FlushCallback callback);
+    method public static void configure(android.content.Context? context, String? key);
+    method public static void configure(android.content.Context? context, String? key, optional String? baseUrl);
+    method public static void configure(android.content.Context? context, String? key, optional String? baseUrl, optional org.revdog.retriever.Options? options);
+    method public static void flush(optional boolean includeContext, org.revdog.retriever.FlushCallback? callback);
+    method public static void flush(org.revdog.retriever.FlushCallback? callback);
     method @InaccessibleFromKotlin public static String? getInstallId();
     method @InaccessibleFromKotlin public static org.revdog.retriever.LogLevel getLocalLevel();
     method @InaccessibleFromKotlin public static String? getSupportCode();
     method @InaccessibleFromKotlin public static org.revdog.retriever.LogLevel getUploadLevel();
     method @InaccessibleFromKotlin public static boolean isEnabled();
-    method public static void log(org.revdog.retriever.LogLevel level, String? msg);
-    method public static void log(org.revdog.retriever.LogLevel level, String? msg, optional String? tag);
-    method public static void log(org.revdog.retriever.LogLevel level, String? msg, optional String? tag, optional java.util.Map<java.lang.String,? extends java.lang.Object?>? attrs);
-    method public static void log(org.revdog.retriever.LogLevel level, String? msg, optional String? tag, optional java.util.Map<java.lang.String,? extends java.lang.Object?>? attrs, optional Throwable? error);
+    method public static void log(org.revdog.retriever.LogLevel? level, String? msg);
+    method public static void log(org.revdog.retriever.LogLevel? level, String? msg, optional String? tag);
+    method public static void log(org.revdog.retriever.LogLevel? level, String? msg, optional String? tag, optional java.util.Map<java.lang.String,? extends java.lang.Object?>? attrs);
+    method public static void log(org.revdog.retriever.LogLevel? level, String? msg, optional String? tag, optional java.util.Map<java.lang.String,? extends java.lang.Object?>? attrs, optional Throwable? error);
     method public static void purgeLocal();
-    method public static void purgeLocal(Runnable callback);
+    method public static void purgeLocal(Runnable? callback);
     method public static void setEnabled(boolean enabled);
     method public static void setUser(String? id);
     property public static String? installId;
@@ -156,7 +156,7 @@ package org.revdog.retriever {
 
   public final class RetrieverVersion {
     property public static String CURRENT;
-    field public static final String CURRENT = "0.2.0";
+    field public static final String CURRENT = "0.3.0";
     field public static final org.revdog.retriever.RetrieverVersion INSTANCE;
   }
 

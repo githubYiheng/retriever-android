@@ -11,7 +11,11 @@ import java.io.RandomAccessFile
 // （ADR 0019 决定 1 / 13）；旧 session_id / user_id / device 一律取持久化值；
 // cursor = max(cursor 文件, 出站箱里本会话最大 oseq_to)。与 iOS `Recovery.swift` 逐字一致。
 
-private val UNCLEAN_TAG = Bytes.ascii("\"tag\":\"rtv.unclean_exit\"")
+/** 行是不是已合成过的 `rtv.unclean_exit`：解析整行看顶层 `tag` 与 `synthetic`（ADR 0024 决定 9：attrs 里的同名键不算）。 */
+private fun isUncleanExitLine(d: ByteArray, s: Int, e: Int): Boolean {
+    val o = JsonIn.obj(d.copyOfRange(s, e)) ?: return false
+    return o["tag"] == "rtv.unclean_exit" && o["synthetic"] == true
+}
 
 internal fun Engine.recoverOldSessions() {
     val cur = current ?: return
@@ -22,24 +26,25 @@ internal fun Engine.recoverOldSessions() {
             outMax[m.sessionId] = maxOf(outMax[m.sessionId] ?: 0, m.oseqTo)
         }
     }
-    val existing = locks.withDirLock { Pair(readClosedLocked().map { it.sessionId }.toSet(), readDropsLocked()) }
+    // 目录锁拿不到：本次不恢复（读不到已有的终态 / 墓碑就会重复写），下次启动重试
+    val existing = locks.withDirLock { Pair(readClosedLocked().map { it.sessionId }.toSet(), readDropsLocked()) } ?: return
     var latest: SessionMeta? = null
 
     for (sid in Fs.list(procDir)) {
         if (!Ids.isUuid(sid) || sid == cur.meta.sessionId) continue
         val dir = File(procDir, sid)
-        // 活着的会话（别的进程 / 同进程另一实例持有 meta.json 的锁）不动
-        val metaFile = File(dir, "meta.json")
-        var lock: SessionLock? = null
-        if (metaFile.isFile) lock = SessionLock.tryAcquire(metaFile) ?: continue
+        // 活着的会话（别的进程 / 同进程另一实例持有会话目录的 `lock`）不动；旧版本留下的会话没有 `lock`：建它并加锁，拿得到 = 死会话
+        val lock = SessionLock.tryAcquire(dir) ?: continue
         try {
             val m = recoverOne(sid, dir, now, outMax, existing.first, existing.second)
-            if (m != null && (latest == null || m.sessionNo > latest.sessionNo)) latest = m
+            // 「上一个会话」按 started_ms（孤儿 pre 文件收编出的会话 session_no 是事后分配的，ADR 0023）
+            if (m != null && (latest == null || m.startedMs > latest.startedMs)) latest = m
         } finally {
-            lock?.release()
+            lock.release()
         }
     }
     previousAppVersion = latest?.device?.appVersion
+    recovered = true
 }
 
 /** 恢复一个旧会话；返回它的 meta（用于判断 app_version 变化）。 */
@@ -57,6 +62,14 @@ private fun Engine.recoverOne(
     if (meta == null) {
         if (segNames.isEmpty()) Fs.remove(dir)
         return null
+    }
+    // 收编是否已提交，三态：确认不存在或确认长度为 0 = 已提交，按普通会话恢复；长度 > 0 = 未提交（重新收编在 adoptOrphans 里做，
+    // 这里还在说明那一步没成）；stat 出错 = 判定不了。后两种本轮都跳过（不重做、不当普通会话恢复），下次重试
+    val pre = meta.pre
+    if (pre != null) {
+        val pf = File(preDir, pre)
+        val committed = Fs.isMissing(pf) || (pf.isFile && pf.length() == 0L)
+        if (!committed) return meta
     }
     val cursor = Fs.read(File(dir, "cursor.json"))?.let { Cursor.decode(it) } ?: Cursor()
     cursor.extractedThroughOseq = maxOf(cursor.extractedThroughOseq, outMax[sid] ?: 0)
@@ -130,7 +143,7 @@ private fun Engine.recoverOne(
         }
         val lastFile = files.lastOrNull()
         val lastLine = lastFile?.lines?.lastOrNull()
-        val alreadySynth = lastLine != null && Bytes.contains(UNCLEAN_TAG, lastFile.data, lastLine.start, lastLine.end)
+        val alreadySynth = lastLine != null && isUncleanExitLine(lastFile.data, lastLine.start, lastLine.end)
         // 合成行也是写入：只看本进程内存开关（禁用 = 不写，ADR 0020 决定 2）
         if (exit == SessionExit.UNCLEAN_FG && !alreadySynth && enabled) {
             val oblig = LogLevel.ERROR.rank >= effective.uploadLevel.rank

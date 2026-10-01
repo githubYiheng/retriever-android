@@ -27,10 +27,14 @@ public class RetrieverTree internal constructor(
     override fun isLoggable(tag: String?, priority: Int): Boolean = levelOf(priority) >= localLevel()
 
     override fun log(priority: Int, tag: String?, message: String, t: Throwable?) {
-        val level = levelOf(priority)
-        if (level < localLevel()) return
-        val msg = if (t == null) message else strip(message, t)
-        emit(level, msg, tag, t)
+        try {
+            val level = levelOf(priority)
+            if (level < localLevel()) return
+            val msg = if (t == null) message else strip(message, t)
+            emit(level, msg, tag, t)
+        } catch (e: Throwable) {
+            // 绝不抛给宿主（宿主异常的 printStackTrace / toString 抛异常等）
+        }
     }
 
     internal companion object {

@@ -76,6 +76,11 @@ internal data class SessionMeta(
     val device: Device,
     val process: String,
     val installId: String? = null,
+    /**
+     * 可选键 `pre`（ADR 0023）：本会话正在收编的 pre 文件名（`<uuid>.jsonl`，在 `<root>/pre/` 下）。
+     * 所指文件仍在 = 收编未提交（恢复时清掉已写的段与游标、从 pre 文件重做）；不在 = 已提交。提交后清掉。旧版忽略。
+     */
+    val pre: String? = null,
 ) {
     fun encode(): ByteArray {
         val o = JsonOut()
@@ -85,6 +90,7 @@ internal data class SessionMeta(
         o.raw(",\"device\":"); device.encode(o)
         o.raw(",\"process\":"); o.string(process)
         installId?.let { o.raw(",\"install_id\":"); o.string(it) }
+        pre?.let { o.raw(",\"pre\":"); o.string(it) }
         o.raw("}")
         return o.toByteArray()
     }
@@ -98,8 +104,12 @@ internal data class SessionMeta(
             if (no < 1) return null
             val dev = Device.decode(o["device"]) ?: return null
             val iid = (o["install_id"] as? String)?.takeIf { Ids.isUuid(it) }
-            return SessionMeta(sid, no, JsonIn.int64(o["started_ms"]) ?: 0, dev, (o["process"] as? String) ?: "main", iid)
+            val pre = (o["pre"] as? String)?.takeIf { isPreName(it) }
+            return SessionMeta(sid, no, JsonIn.int64(o["started_ms"]) ?: 0, dev, (o["process"] as? String) ?: "main", iid, pre)
         }
+
+        /** `<小写 uuid>.jsonl`（只认这个形状：meta 里的名字会被拼进路径）。 */
+        fun isPreName(s: String): Boolean = s.length == 42 && s.endsWith(".jsonl") && Ids.isUuid(s.substring(0, 36))
     }
 }
 
@@ -153,6 +163,10 @@ internal data class SegInfo(
     var obligCount: Int = 0,
     var hasError: Boolean = false,
     var bytes: Long = 0,
+    /** 写入侧统计（同 iOS SegInfo）：error 及以上的行数、首末 ts——段随目录消失时按它并入没落盘的行计数。 */
+    var errorLines: Int = 0,
+    var firstTs: Long = 0,
+    var lastTs: Long = 0,
 ) {
     companion object {
         fun from(f: SegmentFile, file: File): SegInfo {
@@ -317,13 +331,26 @@ internal object Jsonl {
     }
 }
 
-/** mapping.json：{user_id, device_digest, acked_ms}（上次被服务端确认的映射） */
-internal data class MappingState(val userId: String?, val deviceDigest: String, val ackedMs: Long) {
+/**
+ * mapping.json：{user_id, device_digest, acked_ms, key_fp?, base_url?}（上次被服务端确认的映射）。
+ * `key_fp` / `base_url`（ADR 0024 决定 7）= 确认它的那次请求所用的 key 指纹与 baseUrl；与当前不同（含旧文件没有这两个键）= 未确认，重发。
+ */
+internal data class MappingState(
+    val userId: String?,
+    val deviceDigest: String,
+    val ackedMs: Long,
+    val keyFp: String? = null,
+    val baseUrl: String? = null,
+    /** 文件里有 key_fp / base_url 键（旧版本写的两个都没有 = 视为当前目标）。 */
+    val hasIdentity: Boolean = true,
+) {
     fun encode(): ByteArray {
         val o = JsonOut()
         o.raw("{\"user_id\":"); o.stringOrNull(userId)
         o.raw(",\"device_digest\":"); o.string(deviceDigest)
         o.raw(",\"acked_ms\":"); o.int(ackedMs)
+        o.raw(",\"key_fp\":"); o.stringOrNull(keyFp)
+        o.raw(",\"base_url\":"); o.stringOrNull(baseUrl)
         o.raw("}")
         return o.toByteArray()
     }
@@ -332,7 +359,10 @@ internal data class MappingState(val userId: String?, val deviceDigest: String, 
         fun decode(b: ByteArray): MappingState? {
             val o = JsonIn.obj(b) ?: return null
             val d = o["device_digest"] as? String ?: return null
-            return MappingState(o["user_id"] as? String, d, JsonIn.int64(o["acked_ms"]) ?: 0)
+            return MappingState(
+                o["user_id"] as? String, d, JsonIn.int64(o["acked_ms"]) ?: 0, o["key_fp"] as? String, o["base_url"] as? String,
+                o.containsKey("key_fp") || o.containsKey("base_url"),
+            )
         }
     }
 }
@@ -514,8 +544,9 @@ internal object OutboxName {
 }
 
 /**
- * backoff.json：{attempt, next_at_wall_ms, next_at_mono_ms, paused_until_ms, paused_categories, reason, last_ack_ms}
+ * backoff.json：{attempt, next_at_wall_ms, next_at_mono_ms, paused_until_ms, paused_categories, reason, last_ack_ms, key_fp?, base_url?}
  * （`last_ack_ms`：墓碑 last_ack_age_ms 需要跨启动的「上次 2xx」时刻，同 iOS）。
+ * `key_fp` / `base_url`（ADR 0024 决定 7）：这份退避 / 暂停属于哪把 key、哪个服务端；与当前不同（含旧文件没有这两个键）= 不继承。
  */
 internal data class BackoffState(
     var attempt: Int = 0,
@@ -526,6 +557,10 @@ internal data class BackoffState(
     var pausedCategories: List<String> = emptyList(),
     var reason: String = "",
     var lastAckMs: Long = -1,
+    var keyFp: String? = null,
+    var baseUrl: String? = null,
+    /** 文件里有 key_fp / base_url 键（旧版本写的两个都没有 = 视为当前目标）。 */
+    var hasIdentity: Boolean = true,
 ) {
     fun encode(): ByteArray {
         val o = JsonOut()
@@ -540,9 +575,14 @@ internal data class BackoffState(
         }
         o.raw("],\"reason\":"); o.string(reason)
         o.raw(",\"last_ack_ms\":"); o.int(lastAckMs)
+        o.raw(",\"key_fp\":"); o.stringOrNull(keyFp)
+        o.raw(",\"base_url\":"); o.stringOrNull(baseUrl)
         o.raw("}")
         return o.toByteArray()
     }
+
+    /** 换了 key 指纹或 baseUrl：清鉴权暂停、类别暂停与退避（`last_ack_ms` 保留：它只用来算墓碑的「距上次确认」）。 */
+    fun forIdentity(fp: String, base: String): BackoffState = BackoffState(lastAckMs = lastAckMs, keyFp = fp, baseUrl = base)
 
     companion object {
         /** 冷启动：单调时钟不跨进程，用墙钟换算；next_at 晚于 now + 15 min（时钟回拨）截断。 */
@@ -555,6 +595,9 @@ internal data class BackoffState(
             s.pausedCategories = (JsonIn.asList(o["paused_categories"]) ?: emptyList()).mapNotNull { it as? String }
             s.reason = (o["reason"] as? String) ?: ""
             s.lastAckMs = JsonIn.int64(o["last_ack_ms"]) ?: -1
+            s.keyFp = o["key_fp"] as? String
+            s.baseUrl = o["base_url"] as? String
+            s.hasIdentity = o.containsKey("key_fp") || o.containsKey("base_url")
             val nextWait = minOf(maxOf(s.nextAtWallMs - nowWall, 0), Limits.BACKOFF_MAX_MS)
             s.nextAtWallMs = if (nextWait > 0) nowWall + nextWait else 0
             s.nextAtMonoMs = if (nextWait > 0) nowMono + nextWait else 0

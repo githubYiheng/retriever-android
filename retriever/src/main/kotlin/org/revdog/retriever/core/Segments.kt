@@ -75,8 +75,13 @@ internal object Segments {
 
     /** 读段文件。`validate` = 逐行 JSON 校验（恢复孤儿段时用；平时只解析前缀）。 */
     fun read(file: File, validate: Boolean): SegmentFile? {
-        val p = parseName(file.name) ?: return null
         val data = Fs.read(file) ?: return null
+        return parse(file, data, validate)
+    }
+
+    /** 解析已读出的段字节（文件名不合规返回 null）。 */
+    fun parse(file: File, data: ByteArray, validate: Boolean): SegmentFile? {
+        val p = parseName(file.name) ?: return null
         val seg = SegmentFile(file, p.segNo, null, data, ArrayList(), 0, 0)
         var start = 0
         var first = true
@@ -217,6 +222,19 @@ internal object Segments {
         }
         return Pair(seq, oseq)
     }
+
+    private val CTX_SUFFIXES: List<ByteArray> = listOf(
+        Bytes.ascii(",\"ctx\":true}"),
+        Bytes.ascii(",\"ctx\":true,\"synthetic\":true}"),
+        Bytes.ascii(",\"ctx\":true,\"truncated\":true}"),
+        Bytes.ascii(",\"ctx\":true,\"synthetic\":true,\"truncated\":true}"),
+    )
+
+    /**
+     * 行是不是 ctx 行：按固定位置判断（ADR 0024 决定 9）——`ctx` 只出现在行尾、exc 之后、synthetic / truncated 之前。
+     * 行尾的字节由编码器决定：attrs / exc 结尾是 `}}`、msg / tag 结尾是 `"}`，字符串里的引号都已转义，attrs 里的同名键不会命中。
+     */
+    fun isCtxLine(raw: ByteArray, s: Int, e: Int): Boolean = CTX_SUFFIXES.any { Bytes.hasSuffix(raw, s, e, it) }
 
     private val CTX_INSERT_BEFORE: List<ByteArray> = listOf(
         Bytes.ascii(",\"synthetic\":true,\"truncated\":true}"),

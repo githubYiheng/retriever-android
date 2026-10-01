@@ -32,7 +32,7 @@ class LayoutAndPerfTests : RtvTest() {
         assertTrue(h.readJson(File(h.root, "backoff.json")).containsKey("last_ack_ms"))
         assertTrue(obj(h.readJson(File(h.root, "config.json"))["config"]).containsKey("upload_level"))
         val files = h.sessionDir().list()!!.sorted()
-        assertEquals(listOf("cursor.json", "meta.json", "seg-000001.sealed", "seg-000002.open"), files)
+        assertEquals("会话锁在专用文件 lock 上（0.3.0）", listOf("cursor.json", "lock", "meta.json", "seg-000001.sealed", "seg-000002.open"), files)
         // 第二次启动：计数器 +1，install_id 不变
         val h2 = Harness(root = h.root, key = "", clock = h.clock)
         h2.settle()

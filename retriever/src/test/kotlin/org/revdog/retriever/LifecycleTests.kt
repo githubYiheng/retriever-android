@@ -65,9 +65,10 @@ class LifecycleTests : RtvTest() {
         h.settle()
         h.client.log(LogLevel.INFO, "ctx", null, null, null)
         h.client.log(LogLevel.FATAL, "dying", null, null, IllegalStateException("x"))
-        // log() 返回时 p0 已在出站箱、作业已排（进程随后可能立即死亡）
-        assertEquals(1, h.outboxFiles("p0").size)
+        // log() 返回时作业已在调用线程上排好（进程随后可能立即死亡）；p0 由引擎线程异步物化（ADR 0020 决定 1）
         assertEquals(listOf(4242), h.platform.scheduledJobs.toList())
+        h.settle()
+        assertEquals(1, h.outboxFiles("p0").size)
     }
 
     @Test

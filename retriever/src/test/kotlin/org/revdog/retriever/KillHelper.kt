@@ -12,9 +12,10 @@ import java.io.PrintWriter
 import java.io.StringWriter
 
 // 只给测试用（真杀进程验收 R-1，方案 §3.11）：用给定 root 写 N 行（含 warn / error），
-// 可选在最后写半行（模拟撕裂的 write），然后 Runtime.halt(137)——不跑任何 shutdown hook、不给任何收尾机会。
+// 可选在最后写半行（模拟撕裂的 write）或写一条 fatal（log() 一返回就杀，异步封段来不及做），
+// 然后 Runtime.halt(137)——不跑任何 shutdown hook、不给任何收尾机会。
 //
-//   java -cp <test runtime classpath> org.revdog.retriever.KillHelperKt <root> <N> [--torn]
+//   java -cp <test runtime classpath> org.revdog.retriever.KillHelperKt <root> <N> [--torn] [--fatal]
 
 private object NoTransport : Transport {
     override fun send(request: HttpRequest): HttpResponse? = null
@@ -38,6 +39,8 @@ private object HeadlessPlatform : Platform {
     override fun availableBytes(dir: File): Long? = null
 
     override fun scheduleUploadJob(jobId: Int) = Unit
+
+    override fun cancelUploadJob(jobId: Int) = Unit
 
     override fun stackTraceString(t: Throwable): String = StringWriter().also { t.printStackTrace(PrintWriter(it)) }.toString()
 
@@ -66,6 +69,10 @@ fun main(args: Array<String>) {
         val f = client.debugOpenSegmentFile!!
         val (seq, oseq) = client.debugCounters
         FileOutputStream(f, true).use { it.write("{\"seq\":${seq + 1},\"oseq\":${oseq + 1},\"ts\":1,\"level\":\"warn\",\"msg\":\"to".toByteArray()) }
+    }
+    if (args.contains("--fatal")) {
+        // fatal：调用线程上只写行与换段，封段物化在引擎线程上异步做（ADR 0020 决定 1）——下面立即杀进程
+        client.log(LogLevel.FATAL, "last words", "kill", null, IllegalStateException("fatal"))
     }
     // 输出计数给测试核对，然后硬杀自己
     val (seq, oseq) = client.debugCounters

@@ -103,14 +103,17 @@ package org.revdog.retriever {
     method @InaccessibleFromKotlin public static org.revdog.retriever.LogLevel getLocalLevel();
     method @InaccessibleFromKotlin public static String? getSupportCode();
     method @InaccessibleFromKotlin public static org.revdog.retriever.LogLevel getUploadLevel();
+    method @InaccessibleFromKotlin public static boolean isEnabled();
     method public static void log(org.revdog.retriever.LogLevel level, String? msg);
     method public static void log(org.revdog.retriever.LogLevel level, String? msg, optional String? tag);
     method public static void log(org.revdog.retriever.LogLevel level, String? msg, optional String? tag, optional java.util.Map<java.lang.String,? extends java.lang.Object?>? attrs);
     method public static void log(org.revdog.retriever.LogLevel level, String? msg, optional String? tag, optional java.util.Map<java.lang.String,? extends java.lang.Object?>? attrs, optional Throwable? error);
     method public static void purgeLocal();
+    method public static void purgeLocal(Runnable callback);
     method public static void setEnabled(boolean enabled);
     method public static void setUser(String? id);
     property public static String? installId;
+    property public static boolean isEnabled;
     property public static org.revdog.retriever.LogLevel localLevel;
     property public static String? supportCode;
     property public static org.revdog.retriever.LogLevel uploadLevel;
@@ -153,7 +156,7 @@ package org.revdog.retriever {
 
   public final class RetrieverVersion {
     property public static String CURRENT;
-    field public static final String CURRENT = "0.1.2";
+    field public static final String CURRENT = "0.2.0";
     field public static final org.revdog.retriever.RetrieverVersion INSTANCE;
   }
 

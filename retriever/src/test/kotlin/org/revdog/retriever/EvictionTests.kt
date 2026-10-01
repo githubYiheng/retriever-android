@@ -1,5 +1,6 @@
 package org.revdog.retriever
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -7,6 +8,7 @@ import org.junit.Test
 import org.revdog.retriever.core.ClientConstants
 import org.revdog.retriever.core.ClosedSession
 import org.revdog.retriever.core.DropEntry
+import org.revdog.retriever.core.Engine
 import org.revdog.retriever.core.Fs
 import org.revdog.retriever.core.Ids
 import org.revdog.retriever.core.Jsonl
@@ -158,47 +160,148 @@ class EvictionTests : RtvTest() {
         assertEquals(0, h.readJsonl("drops.jsonl").size)
     }
 
+    /**
+     * drops.jsonl 到上限只做无损合并（ADR 0019 决定 4）：同会话同 reason 相接 / 重叠的并成一条、n = 并集长度；稀疏的不并宽；
+     * 仍超出删最旧的未在途条目。旧实现按 (会话, reason) 并成 [min, max]，盖住真实缺口。
+     */
     @Test
-    fun dropsFileCappedAndMergedByReason() {
+    fun dropsFileCapOnlyLosslessMerge() {
         val h = Harness(key = "")
         h.settle()
         val sid = h.client.writer.currentSessionId
-        val entries = (1..1100).map { i ->
-            val o = i * 2L
-            DropEntry(sid, o, o, 1, if (i % 2 == 0) "write_failed" else "buffer_overflow", i.toLong(), -1)
-        }
-        h.work { it.appendDrops(entries) }
-        val drops = h.readJsonl("drops.jsonl")
-        assertTrue(drops.size <= ClientConstants.DROPS_FILE_MAX_ENTRIES)
-        assertEquals("合并计数不丢", 1100L, drops.sumOf { int(it["n"]) })
-        assertEquals(setOf("write_failed", "buffer_overflow"), drops.map { it["reason"] }.toSet())
-        // 单批 ≤ 100 条，超出按 reason 合并
-        h.l(LogLevel.WARN, "carrier")
-        h.seal()
-        val env = h.envelopes().first()
-        val d = objs(env["drops"])
-        assertTrue(d.size <= Limits.DROPS_PER_BATCH)
-        assertEquals(1100L, d.sumOf { int(it["n"]) })
-        assertAllValid(runValidator(listOf(env)))
+        // 1100 条稀疏单点（间隔 1，互不相接）+ 3 组相接的区间（各可并成一条）+ 一个别的会话的同区间（不跨会话合并）
+        val sparse = (1..1100).map { i -> DropEntry(sid, i * 2L, i * 2L, 1, "write_failed", i.toLong(), -1) }
+        val adjacent = listOf(
+            DropEntry(sid, 10_000, 10_004, 5, "buffer_overflow", 1, -1), DropEntry(sid, 10_005, 10_009, 5, "buffer_overflow", 2, -1),
+            DropEntry(sid, 20_000, 20_009, 10, "corrupt", 3, -1), DropEntry(sid, 20_005, 20_019, 15, "corrupt", 4, -1),
+        )
+        val other = Ids.newV4()
+        val foreign = DropEntry(other, 10_000, 10_004, 5, "buffer_overflow", 5, -1)
+        val input = sparse + adjacent + foreign
+        h.work { it.appendDrops(input) }
+        val drops = h.readJsonl("drops.jsonl").map { DropEntry.decode(it)!! }
+        assertEquals(ClientConstants.DROPS_FILE_MAX_ENTRIES, drops.size)
+        // 每条 n == 区间长度、session 是真实归属
+        for (d in drops) assertEquals("$d", d.oseqTo - d.oseqFrom + 1, d.n)
+        assertTrue(drops.contains(DropEntry(sid, 10_000, 10_009, 10, "buffer_overflow", 2, -1)))
+        assertTrue(drops.contains(DropEntry(sid, 20_000, 20_019, 20, "corrupt", 4, -1)))
+        assertTrue("不跨会话合并", drops.contains(foreign))
+        // 没有任何条目覆盖输入里不存在的 oseq
+        val inputCover = input.filter { it.sessionId == sid }.flatMap { (it.oseqFrom..it.oseqTo).toList() }.toSet()
+        for (d in drops.filter { it.sessionId == sid }) assertTrue("$d", inputCover.containsAll((d.oseqFrom..d.oseqTo).toList()))
+        // 仍超出删的是最旧的（文件最前面的稀疏点），最新的保留
+        assertFalse(drops.any { it.oseqFrom == 2L })
+        assertTrue(drops.any { it.oseqFrom == 2200L })
     }
 
+    /** 无损合并只收合法区间：oseq_from < 1 的非 backfill 条目（如 0..0、n = 1）原样保留、不参与合并（同 iOS）。 */
     @Test
-    fun closedSessionsCappedAtTwenty() {
+    fun capDropsKeepsInvalidRangeUnmerged() {
+        val sid = Ids.newV4()
+        val zero = DropEntry(sid, 0, 0, 1, "corrupt", 1, -1)
+        val all = listOf(zero, DropEntry(sid, 1, 1, 1, "corrupt", 2, -1), DropEntry(sid, 2, 2, 1, "corrupt", 3, -1))
+        assertEquals(listOf(zero, DropEntry(sid, 1, 2, 2, "corrupt", 3, -1)), Engine.capDrops(all, emptySet(), 2))
+    }
+
+    /** 每批按文件顺序带最旧的 100 条墓碑：各自会话与精确区间，不合并；带不完的留给下一批（ADR 0019 决定 2）。 */
+    @Test
+    fun dropsCarriedUnmergedOldestFirst() {
         val h = Harness(key = "")
         h.settle()
-        val closed = (1..25).map { i -> ClosedSession(Ids.newV4(), i.toLong(), i * 1000L, i * 1000L + 500, 10, 2, "clean_bg") }
-        Fs.append(File(h.root, "sessions.jsonl"), Jsonl.encodeClosed(closed))
-        h.l(LogLevel.WARN, "carrier")
+        val entries = (1..150).map { i -> DropEntry(Ids.newV4(), 5, 7, 3, "buffer_overflow", i.toLong(), -1) }
+        h.work { it.appendDrops(entries) }
+        val before = File(h.root, "drops.jsonl").readBytes()
+        h.l(LogLevel.WARN, "carrier 1")
         h.seal()
-        val env = h.envelopes().first()
-        val cs = objs(env["closed_sessions"])
-        assertEquals(Limits.CLOSED_SESSIONS_PER_BATCH, cs.size)
-        assertEquals(5L, int(env["closed_sessions_dropped"]))
-        assertEquals((6L..25L).toSet(), cs.map { int(it["session_no"]) }.toSet())
-        assertEquals("更旧的 5 条已合并为计数", 20, h.readJsonl("sessions.jsonl").size)
+        assertArrayEquals("携带不改写文件", before, File(h.root, "drops.jsonl").readBytes())
+        val first = objs(h.envelopes().single()["drops"])
+        assertEquals(Limits.DROPS_PER_BATCH, first.size)
+        assertEquals(entries.take(100).map { it.sessionId }, first.map { it["session_id"] })
+        assertTrue(first.all { int(it["oseq_from"]) == 5L && int(it["oseq_to"]) == 7L && int(it["n"]) == 3L })
+        h.clock.advance(1)
+        h.l(LogLevel.WARN, "carrier 2")
+        h.seal()
+        val second = objs(h.envelopes().single { e -> e.lines.any { it["msg"] == "carrier 2" } }["drops"])
+        assertEquals(entries.drop(100).map { it.sessionId }, second.map { it["session_id"] })
+        assertAllValid(runValidator(h.envelopes()))
+        // 两批都确认后文件清空
+        h.enableUpload()
+        h.tick(2000)
+        assertEquals(emptyList<String>(), h.outboxFiles())
+        assertEquals(0, h.readJsonl("drops.jsonl").size)
+    }
+
+    /**
+     * 30 条非空终态：第一批最旧 20 条、第二批 10 条；全程没有 closed_sessions_dropped，携带前后文件字节不变（ADR 0019 决定 2）。
+     * 旧实现第一批带 20 条、把更旧的 10 条从文件里删掉只留一个计数。
+     */
+    @Test
+    fun terminalsCarriedOldestFirstNeverDropped() {
+        val h = Harness(key = "")
+        h.settle()
+        val closed = (1..30).map { i -> ClosedSession(Ids.newV4(), i.toLong(), i * 1000L, i * 1000L + 500, 10, 2, "clean_bg") }
+        Fs.append(File(h.root, "sessions.jsonl"), Jsonl.encodeClosed(closed))
+        val before = File(h.root, "sessions.jsonl").readBytes()
+        h.l(LogLevel.WARN, "carrier 1")
+        h.seal()
+        val env1 = h.envelopes().single()
+        assertEquals((1L..20L).toList(), objs(env1["closed_sessions"]).map { int(it["session_no"]) })
+        assertFalse(env1.map.containsKey("closed_sessions_dropped"))
+        assertArrayEquals("携带不改写文件", before, File(h.root, "sessions.jsonl").readBytes())
+        h.clock.advance(1)
+        h.l(LogLevel.WARN, "carrier 2")
+        h.seal()
+        val env2 = h.envelopes().single { e -> e.lines.any { it["msg"] == "carrier 2" } }
+        assertEquals((21L..30L).toList(), objs(env2["closed_sessions"]).map { int(it["session_no"]) })
+        assertFalse(env2.map.containsKey("closed_sessions_dropped"))
+        assertAllValid(runValidator(listOf(env1, env2)))
         // 2xx 后删除已报条目
         h.enableUpload()
+        h.tick(2000)
         assertEquals(emptyList<String>(), h.outboxFiles())
         assertEquals(0, h.readJsonl("sessions.jsonl").size)
+    }
+
+    /**
+     * 一个有数据的后台会话 + 25 个空的后台会话（Android 每次后台拉起都是一个会话）：空会话不写终态、目录直接删，
+     * 真实会话的终态随载体批上报（ADR 0019 决定 1）。旧实现 26 条终态、真实会话那条被挤掉并从文件删除。
+     */
+    @Test
+    fun realTerminalSurvivesEmptySessions() {
+        val root = tempDir()
+        val p = FakePlatform().apply { foreground = false }
+        val real = Harness(root = root, key = "", platform = p)
+        real.settle()
+        real.l(LogLevel.WARN, "real bg work")
+        val realSid = real.client.writer.currentSessionId
+        real.client.simulateCrash()
+        val clock = real.clock
+        repeat(25) {
+            clock.advance(1000)
+            val empty = Harness(root = root, key = "", platform = p, clock = clock)
+            empty.settle()
+            empty.client.simulateCrash()
+        }
+        val last = Harness(root = root, key = "", platform = p, clock = clock)
+        last.settle()
+        val terms = last.readJsonl("sessions.jsonl")
+        assertEquals(listOf(realSid), terms.map { it["session_id"] })
+        assertTrue(terms.none { int(it["last_oseq"]) == 0L })
+        assertEquals("空会话目录已删，只剩真实会话与当前会话", setOf(realSid, last.client.writer.currentSessionId), File(root, "proc-main").list()!!.toSet())
+        last.l(LogLevel.WARN, "carrier")
+        last.seal()
+        val carriers = last.envelopes().filter { e -> objs(e["closed_sessions"]).any { it["session_id"] == realSid } }
+        assertEquals(1, carriers.size)
+    }
+
+    /** sessions.jsonl 上限 1000 条：超出删最旧的未在途条目（ADR 0019 决定 3）。 */
+    @Test
+    fun sessionsFileCapDropsOldest() {
+        val h = Harness(key = "")
+        h.settle()
+        val closed = (1..1005).map { i -> ClosedSession(Ids.newV4(), i.toLong(), i * 1000L, i * 1000L + 500, 10, 2, "clean_bg") }
+        h.work { it.appendClosed(closed) }
+        val left = h.readJsonl("sessions.jsonl").map { int(it["session_no"]) }
+        assertEquals((6L..1005L).toList(), left)
     }
 }

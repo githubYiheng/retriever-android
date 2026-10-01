@@ -38,8 +38,8 @@ class LayoutAndPerfTests : RtvTest() {
         h2.settle()
         assertEquals(h.client.installId, h2.client.installId)
         assertTrue(h2.client.supportCode!!.endsWith("-2"))
-        // purgeLocal：新 install_id
-        h2.client.purgeLocal()
+        // purgeLocal：新 install_id（清空在后台完成，回调里才是新值，ADR 0020 决定 1）
+        h2.purgeBlocking()
         assertNotEquals(h.client.installId, h2.client.installId)
         assertTrue(h2.client.supportCode!!.endsWith("-1"))
         h2.client.log(LogLevel.WARN, "after purge", null, null, null)

@@ -112,14 +112,20 @@ internal class ConfigCache(
     val fetchedWallMs: Long,
     /** 本进程拉到时的单调时刻；从文件恢复的缓存为 null（改用墙钟）。 */
     val fetchedMonoMs: Long?,
+    /** 身份（install_id, user_id）变了：这份配置属于上一个身份，按过期处理直到新身份的响应到达（ADR 0019 决定 12）。 */
+    val identityStale: Boolean = false,
 ) {
     fun elapsedMs(nowWall: Long, nowMono: Long): Long {
         val m = fetchedMonoMs
         return if (m != null) nowMono - m else nowWall - fetchedWallMs
     }
 
+    /** 同一份配置，按过期处理（放大型字段立即回落）。 */
+    fun staleForIdentity(): ConfigCache = ConfigCache(config, fetchedWallMs, fetchedMonoMs, true)
+
     /** 下一次生效配置可能变化的单调时刻（过期 / full_dump 到期），供调度器唤醒。 */
     fun nextChangeMono(nowWall: Long, nowMono: Long): Long? {
+        if (identityStale) return null
         val elapsed = elapsedMs(nowWall, nowMono)
         val cands = ArrayList<Long>()
         val ttl = config.ttlS * 1000L
@@ -135,6 +141,7 @@ internal class ConfigCache(
         /**
          * 生效配置：过期后放大型字段（full_dump、低于宿主默认的 upload_level、高于默认的 context_*、
          * 低于默认的 flush_interval、高于宿主默认的 local_cap）回落到宿主默认 / 内置默认（宪法 U-2）。
+         * 只因身份变化（identityStale）按过期处理时 local_cap 不回落：它不放大上传，回落只会立即驱逐上一个身份攒下的义务批。
          */
         fun effective(cache: ConfigCache?, host: HostDefaults, nowWall: Long, nowMono: Long): EffectiveConfig {
             if (cache == null) {
@@ -143,7 +150,8 @@ internal class ConfigCache(
             }
             var c = cache.config
             val elapsed = cache.elapsedMs(nowWall, nowMono)
-            val expired = elapsed < 0 || elapsed >= c.ttlS * 1000L
+            val ttlExpired = elapsed < 0 || elapsed >= c.ttlS * 1000L
+            val expired = cache.identityStale || ttlExpired
             if (expired) {
                 c = c.copy(
                     fullDump = false,
@@ -152,7 +160,7 @@ internal class ConfigCache(
                     contextLines = minOf(c.contextLines, Limits.CTX_LINES_DEFAULT),
                     contextBytes = minOf(c.contextBytes, Limits.CTX_BYTES_DEFAULT),
                     flushIntervalS = maxOf(c.flushIntervalS, Limits.FLUSH_INTERVAL_S_DEFAULT),
-                    localCapBytes = minOf(c.localCapBytes, host.localCapBytes),
+                    localCapBytes = if (ttlExpired) minOf(c.localCapBytes, host.localCapBytes) else c.localCapBytes,
                 )
             }
             val fullDumpActive = c.fullDump && elapsed >= 0 && elapsed < c.fullDumpTtlS * 1000L

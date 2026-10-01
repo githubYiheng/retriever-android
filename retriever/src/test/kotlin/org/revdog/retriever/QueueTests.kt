@@ -2,6 +2,7 @@ package org.revdog.retriever
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.revdog.retriever.FakeTransport.Reply
@@ -138,15 +139,103 @@ class QueueTests : RtvTest() {
         assertEquals(3L, int(halves[0]["oseq_to"]))
         assertEquals(4L, int(halves[1]["oseq_from"]))
         assertEquals(6L, int(halves[1]["oseq_to"]))
-        val iid = h.client.installId!!
+        // 半批用区间两端命名（ADR 0019 决定 11）：与原批（…:primary:1）必不同名；install 取原批信封
+        val iid = original["install_id"] as String
         val sid = original["session_id"] as String
-        assertEquals(Ids.batchId(iid, sid, Ids.BatchKind.PRIMARY, 1), halves[0]["batch_id"])
-        assertEquals(Ids.batchId(iid, sid, Ids.BatchKind.PRIMARY, 4), halves[1]["batch_id"])
+        assertEquals(Ids.splitBatchId(iid, sid, 1, 3), halves[0]["batch_id"])
+        assertEquals(Ids.splitBatchId(iid, sid, 4, 6), halves[1]["batch_id"])
+        assertNotEquals(original["batch_id"], halves[0]["batch_id"])
+        assertEquals(original["created_ms"], halves[0]["created_ms"])
         // ctx 跟着含 error 的那一半；p0 先发
         assertEquals(4L, int(a["oseq_from"]))
         assertTrue(halves[1].lines.any { it["ctx"] == true })
         assertFalse(halves[0].lines.any { it["ctx"] == true })
         assertAllValid(runValidator(listOf(a, b)))
+    }
+
+    /**
+     * 413 切分的后一半写不出（目标路径被占）：本次已写的前一半删掉、原批原样保留，墓碑 0 条、区间一个不少；
+     * 恢复写入后下一轮收敛为两半、原批删除（ADR 0019 决定 11）。旧实现前一半与原批同名、原地覆盖，4..6 静默丢失。
+     */
+    @Test
+    fun tooLargeSplitNeverLosesRange() {
+        val h = Harness(key = "")
+        h.settle()
+        for (i in 1..6) h.l(LogLevel.WARN, "w$i")
+        h.seal()
+        val original = h.outboxFiles().single()
+        val env0 = h.envelopes().single()
+        val iid = env0["install_id"] as String
+        val sid = env0["session_id"] as String
+        val created = int(env0["created_ms"])
+        val blocker = File(h.outbox, "p1-$created-${Ids.splitBatchId(iid, sid, 4, 6)}.gz")
+        assertTrue(blocker.mkdir())
+        File(blocker, "occupied").writeText("x")
+        h.transport.setScript(listOf(Reply.Status(413, mapOf("reason" to "too_large")), Reply.Status(413, mapOf("reason" to "too_large"))))
+        h.enableUpload()
+        assertEquals(1, h.transport.batchRequests.size)
+        assertTrue("原批仍在", File(h.outbox, original).isFile)
+        assertFalse("本次写出的前一半已回滚", File(h.outbox, "p1-$created-${Ids.splitBatchId(iid, sid, 1, 3)}.gz").exists())
+        val covered = h.outboxFiles().mapNotNull { n -> File(h.outbox, n).takeIf { it.isFile }?.let { Env.ofGzip(n, it.readBytes()) } }
+            .flatMap { e -> (int(e["oseq_from"])..int(e["oseq_to"])).toList() }.toSet()
+        assertTrue("$covered", covered.containsAll((1L..6L).toList()))
+        assertEquals(0, h.readJsonl("drops.jsonl").size)
+        assertEquals("切分失败按普通失败退避", "http_413", h.backoff.reason)
+        // 恢复写入：原批再 413 → 两半都写成 → 原批删除 → 两半依次上传
+        assertTrue(blocker.deleteRecursively())
+        h.tick(2000)
+        assertEquals(2, h.transport.batchRequests.size)
+        assertFalse(File(h.outbox, original).exists())
+        h.tick(2000)
+        h.tick(2000)
+        assertEquals(4, h.transport.batchRequests.size)
+        assertEquals(emptyList<String>(), h.outboxFiles())
+        val sent = h.transport.batchRequests.drop(2).map { env(it) }.sortedBy { int(it["oseq_from"]) }
+        assertEquals(listOf(1L to 3L, 4L to 6L), sent.map { int(it["oseq_from"]) to int(it["oseq_to"]) })
+        assertEquals(listOf(Ids.splitBatchId(iid, sid, 1, 3), Ids.splitBatchId(iid, sid, 4, 6)), sent.map { it["batch_id"] })
+    }
+
+    /** 请求头 `X-Rtv-Install` 取批自身信封里的 install_id（ADR 0019 决定 10），不取当前 install。 */
+    @Test
+    fun batchHeaderUsesEnvelopeInstall() {
+        val h = Harness(key = "")
+        h.settle()
+        h.l(LogLevel.WARN, "from another install")
+        h.seal()
+        val name = h.outboxFiles().single()
+        val env0 = h.envelopes().single()
+        // 把这一批改写成别的 install 的批（多进程清空窗口里别的进程写进来的那种）
+        val other = Ids.newV4()
+        val json = String(env0.raw, Charsets.UTF_8).replace(env0["install_id"] as String, other)
+        File(h.outbox, name).writeBytes(org.revdog.retriever.core.Gzip.compress(json.toByteArray())!!)
+        h.work { it.metas.clear() }
+        h.enableUpload()
+        assertEquals(1, h.transport.batchRequests.size)
+        val r = h.transport.batchRequests[0]
+        assertEquals(other, env(r)["install_id"])
+        assertEquals("请求头 == 信封", other, r.headers["X-Rtv-Install"])
+        assertNotEquals(h.client.installId, r.headers["X-Rtv-Install"])
+    }
+
+    /** 被服务端隔离（status = quarantined）的带映射批：确认删批，但不把映射记成已确认，下一批重发映射（ADR 0019 决定 10）。 */
+    @Test
+    fun quarantinedAckDoesNotConfirmMapping() {
+        val h = Harness()
+        h.settle()
+        h.transport.responder = { bid -> Reply.Status(200, mapOf("batch_id" to bid, "status" to "quarantined", "config_etag" to "etag-0")) }
+        h.l(LogLevel.WARN, "w1")
+        h.sealAndDrain()
+        assertEquals(1, h.transport.batchRequests.size)
+        assertTrue("批里带了映射", env(h.transport.batchRequests[0]).map.containsKey("mapping"))
+        assertEquals("隔离也算确认：删批", emptyList<String>(), h.outboxFiles())
+        assertFalse("映射没记成已确认", File(h.root, "mapping.json").exists())
+        h.transport.responder = null
+        h.clock.advance(Limits.MIN_REQUEST_SPACING_MS)
+        h.l(LogLevel.WARN, "w2")
+        h.sealAndDrain()
+        assertEquals(2, h.transport.batchRequests.size)
+        assertTrue("下一批重发映射", env(h.transport.batchRequests[1]).map.containsKey("mapping"))
+        assertTrue(File(h.root, "mapping.json").exists())
     }
 
     @Test

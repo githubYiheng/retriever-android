@@ -65,13 +65,17 @@ internal data class InstallInfo(val installId: String, var sessionCounter: Long,
     }
 }
 
-/** meta.json：会话开始时原子写。 */
+/**
+ * meta.json：会话开始时原子写。`install_id`（可选键，ADR 0019 决定 6）= bootstrap 时的 install 身份冗余副本，
+ * install.json 损坏时据此修复；0.1.x 写的 meta 没有这个键（读作 null，不当副本）。
+ */
 internal data class SessionMeta(
     val sessionId: String,
     val sessionNo: Long,
     val startedMs: Long,
     val device: Device,
     val process: String,
+    val installId: String? = null,
 ) {
     fun encode(): ByteArray {
         val o = JsonOut()
@@ -80,6 +84,7 @@ internal data class SessionMeta(
         o.raw(",\"started_ms\":"); o.int(startedMs)
         o.raw(",\"device\":"); device.encode(o)
         o.raw(",\"process\":"); o.string(process)
+        installId?.let { o.raw(",\"install_id\":"); o.string(it) }
         o.raw("}")
         return o.toByteArray()
     }
@@ -92,7 +97,8 @@ internal data class SessionMeta(
             val no = JsonIn.int64(o["session_no"]) ?: return null
             if (no < 1) return null
             val dev = Device.decode(o["device"]) ?: return null
-            return SessionMeta(sid, no, JsonIn.int64(o["started_ms"]) ?: 0, dev, (o["process"] as? String) ?: "main")
+            val iid = (o["install_id"] as? String)?.takeIf { Ids.isUuid(it) }
+            return SessionMeta(sid, no, JsonIn.int64(o["started_ms"]) ?: 0, dev, (o["process"] as? String) ?: "main", iid)
         }
     }
 }
@@ -353,6 +359,7 @@ internal data class EnvelopeHeader(
     var ctxTruncated: Long?,
     var drops: List<DropEntry> = emptyList(),
     var closedSessions: List<ClosedSession> = emptyList(),
+    /** 0.2.0 起物化不再写（ADR 0019 决定 2）；只为 0.1.x 留在出站箱里的旧批被 413 切分时原样带上。 */
     var closedSessionsDropped: Long = 0,
     var mapping: MappingBlock? = null,
 ) {
@@ -456,6 +463,8 @@ internal data class BatchMeta(
     var prio: Int,
     val createdMs: Long,
     val batchId: String,
+    /** 信封里的 install_id：请求头 `X-Rtv-Install` 取它（ADR 0019 决定 10）；读不出的兜底元数据取当前 install。 */
+    val installId: String,
     val kind: Ids.BatchKind,
     val sessionId: String,
     val oseqFrom: Long,

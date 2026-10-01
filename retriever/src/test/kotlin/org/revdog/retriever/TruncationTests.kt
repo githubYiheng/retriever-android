@@ -156,6 +156,29 @@ class TruncationTests {
         assertEquals(true, o2["truncated"])
     }
 
+    /**
+     * 超长 attrs 值先按预算判再转义（ADR 0020 决定 3）：20 MB 的值该键被跳过并打 truncated，其它键照常，耗时有上限
+     * （旧实现先整串转义，按 6 倍分配）。
+     */
+    @Test
+    fun hugeAttrValueBounded() {
+        val huge = "\"".repeat(20 * 1024 * 1024)
+        val attrs = mapOf("a" to "kept", "huge" to huge, "z" to 7L)
+        val t0 = System.nanoTime()
+        val (json, truncated) = LineEncoder.encodeAttrs(attrs)
+        val took = System.nanoTime() - t0
+        assertEquals("{\"a\":\"kept\",\"z\":7}", String(json!!, Charsets.UTF_8))
+        assertTrue(truncated)
+        assertTrue("took ${took / 1_000_000} ms", took < 20_000_000)
+        // 整行编码同样有上限
+        val t1 = System.nanoTime()
+        val e = LineEncoder.encode(line(LogLevel.INFO, "x", attrs = mapOf("huge" to StringBuilder(huge))))
+        assertTrue(System.nanoTime() - t1 < 200_000_000)
+        val (o, _) = decode(e)
+        assertNull(o["attrs"])
+        assertEquals(true, o["truncated"])
+    }
+
     /** 与服务端逐字节核算：validator 的 JSON.stringify(行) ≤ 16384（含 ctx 字段与最大位数的 seq / oseq）。 */
     @Test
     fun worstCaseLinesFitServerLimit() {

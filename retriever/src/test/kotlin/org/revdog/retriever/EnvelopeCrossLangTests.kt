@@ -139,6 +139,7 @@ class EnvelopeCrossLangTests : RtvTest() {
             h.settle()
             h.client.log(LogLevel.INFO, "last words", null, null, null)
             h.client.log(LogLevel.FATAL, "fatal", null, null, IllegalStateException("D"))
+            h.settle()
             cases.add(expect("fatal", h.envelopes("p0").first()))
         }
 

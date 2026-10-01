@@ -14,6 +14,11 @@ import org.revdog.retriever.core.Ids
 import org.revdog.retriever.core.JsonIn
 import org.revdog.retriever.core.JsonOut
 import org.revdog.retriever.core.Limits
+import org.revdog.retriever.core.LineEncoder
+import java.math.BigDecimal
+import java.math.BigInteger
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /** golden 向量（packages/core/golden）：三端与服务端逐字一致。 */
 class GoldenTests {
@@ -55,6 +60,70 @@ class GoldenTests {
         assertNotEquals(Ids.batchId(iid, sid, Ids.BatchKind.BACKFILL, 3), bid)
         assertTrue(Ids.isUuid(bid!!))
         assertNull(Ids.backfillSplitBatchId(iid.uppercase(), sid, 3, 1))
+    }
+
+    /** 413 半批 batch_id（ADR 0019 决定 11）：`<install>:<session>:primary:<oseq_from>:<oseq_to>`，与未切分批必不同名。 */
+    @Test
+    fun idsSplitBatchId() {
+        val g = Repo.golden("ids.json")
+        val vs = objs(g["split_batch_id"])
+        assertTrue(vs.isNotEmpty())
+        for (v in vs) {
+            val iid = v["install_id"] as String
+            val sid = v["session_id"] as String
+            val from = int(v["oseq_from"])
+            val to = int(v["oseq_to"])
+            assertEquals(v["name"], Ids.splitBatchIdName(iid, sid, from, to))
+            assertEquals("${v["name"]}", v["expect"], Ids.splitBatchId(iid, sid, from, to))
+            assertNotEquals(Ids.batchId(iid, sid, Ids.BatchKind.PRIMARY, from), Ids.splitBatchId(iid, sid, from, to))
+        }
+        val iid = vs[0]["install_id"] as String
+        val sid = vs[0]["session_id"] as String
+        assertNull(Ids.splitBatchId(iid, sid, 0, 3))
+        assertNull(Ids.splitBatchId(iid, sid, 4, 3))
+        assertNull(Ids.splitBatchId(iid.uppercase(), sid, 1, 3))
+    }
+
+    /**
+     * 整数 attrs（ADR 0020 决定 3，golden `attrs.json`）：|v| ≤ 2^53 − 1 → JSON 数字，否则十进制字符串，不打 truncated。
+     * 每个向量按它装得下的全部整数类型各跑一遍（Byte / Short / Int / AtomicInteger / Long / AtomicLong / BigInteger / 无小数位 BigDecimal）。
+     */
+    @Test
+    fun attrsIntegers() {
+        val g = Repo.golden("attrs.json")
+        assertEquals("9007199254740991", g["max_safe_integer"])
+        val vs = objs(g["int_attr"])
+        assertTrue(vs.size >= 10)
+        for (v in vs) {
+            val big = BigInteger(v["value"] as String)
+            val forms = ArrayList<Any>()
+            forms.add(big)
+            forms.add(BigDecimal(big))
+            // 负 scale（如 1E+1）也是无小数位
+            if (big.mod(BigInteger.TEN).signum() == 0) forms.add(BigDecimal(big).setScale(-1, java.math.RoundingMode.UNNECESSARY))
+            if (v["fits"] == "int64") {
+                assertTrue(big.bitLength() < 64)
+                val l = big.toLong()
+                forms.add(l)
+                forms.add(AtomicLong(l))
+                if (l in Int.MIN_VALUE..Int.MAX_VALUE) {
+                    forms.add(l.toInt())
+                    forms.add(AtomicInteger(l.toInt()))
+                }
+                if (l in Short.MIN_VALUE..Short.MAX_VALUE) forms.add(l.toShort())
+                if (l in Byte.MIN_VALUE..Byte.MAX_VALUE) forms.add(l.toByte())
+            } else {
+                assertEquals("big", v["fits"])
+            }
+            for (x in forms) {
+                val (json, truncated) = LineEncoder.encodeAttrs(mapOf("v" to x))
+                assertEquals("${x.javaClass.simpleName} ${v["value"]}", "{\"v\":${v["json"]}}", String(json!!, Charsets.UTF_8))
+                assertFalse(truncated)
+            }
+        }
+        // 小数位的 BigDecimal、Double 仍按 JS 数字格式
+        assertEquals("{\"v\":1.5}", String(LineEncoder.encodeAttrs(mapOf("v" to BigDecimal("1.50"))).first!!, Charsets.UTF_8))
+        assertEquals("{\"v\":9007199254740992}", String(LineEncoder.encodeAttrs(mapOf("v" to 9_007_199_254_740_992.0)).first!!, Charsets.UTF_8))
     }
 
     @Test

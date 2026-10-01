@@ -1,12 +1,13 @@
 # Retriever Android 传输层（`sdk/android`）
 
-Kotlin，minSdk 24 / compileSdk 36，JVM 17。规格：`docs/plan/system-design.md` §3；不变式：`docs/architecture.md` §2。
+Kotlin，minSdk 24 / compileSdk 36，JVM 17；**宿主 compileSdk ≥ 36**（AAR 元数据 `minCompileSdk=36`，AGP 9 的默认行为，低于它宿主编译失败）。
+规格：`docs/plan/system-design.md` §3；不变式：`docs/architecture.md` §2。
 行为、字段、顺序、数字与 iOS 实现（`sdk/ios`，已真机验收）逐字一致；只在平台层不同（见文末「与 iOS 的平台差异」）。
 
 | 模块 | 坐标 | 依赖 | 用途 |
 |---|---|---|---|
-| `retriever` | `org.revdog:retriever:0.1.2` | **只有 kotlin-stdlib**（无 AndroidX、无 coroutines、无 okhttp） | 传输层本体 + `RetrieverLog`（`android.util.Log` 替身） |
-| `retriever-timber` | `org.revdog:retriever-timber:0.1.2` | `:retriever` + `com.jakewharton.timber:timber:5.0.1` | `RetrieverTree` |
+| `retriever` | `org.revdog:retriever:0.2.0` | **只有 kotlin-stdlib**（无 AndroidX、无 coroutines、无 okhttp） | 传输层本体 + `RetrieverLog`（`android.util.Log` 替身） |
+| `retriever-timber` | `org.revdog:retriever-timber:0.2.0` | `:retriever` + `com.jakewharton.timber:timber:5.0.1` | `RetrieverTree` |
 
 产物 Kotlin 语言版本 2.0（POM 里的 kotlin-stdlib = 2.0.21），宿主 Kotlin ≥ 2.0 即可。发布渠道：自托管 Maven 仓库 `https://maven.revdog.org/releases`（ADR 0006，与 revenue-dog 共用）+ 公开只读源码镜像 `githubYiheng/retriever-android`；门禁与发布脚本见文末「发布」。
 
@@ -24,16 +25,41 @@ Java：`Retriever.configure(ctx, key)`、`Retriever.log(LogLevel.ERROR, "msg", "
 - 「上报问题」：`Retriever.flush { r -> … }`（回调在 SDK 后台线程上）。向当前段追加合成行（`error`、`tag: "rtv.flush"`、`synthetic: true`，
   无视上传级别一定上传），立即封段并排空；该批 15 s 内被服务端确认 → `FlushResult.Stored`，否则 `Pending("offline" | "backoff" | "paused" | "timeout")`
   （`setEnabled(false)` 时 `Pending("disabled")`）。`flush(includeContext = false)` 时该批不带上下文。
-- 用户撤回同意：`Retriever.setEnabled(false)`（不写不传）；清空本地：`Retriever.purgeLocal()`；客服短码：`Retriever.supportCode`。
+- 用户撤回同意：`Retriever.setEnabled(false)`；清空本地：`Retriever.purgeLocal()` / `Retriever.purgeLocal { … }`；当前状态：`Retriever.isEnabled`；
+  客服短码：`Retriever.supportCode`。两者的语义见下面「同意与清空」。
 - 生效级别（远程配置钳制后）：`Retriever.uploadLevel` / `Retriever.localLevel`，适配器用来早过滤。
 - `attrs` 值只认 String / Number / Boolean / null（其它 `toString()`）；≤ 32 键、≤ 4 KB，超出由 SDK 截断并标 `truncated`。
+  整数型（Byte / Short / Int / Long / AtomicInteger / AtomicLong / BigInteger / 无小数位的 BigDecimal）绝对值 ≤ 2^53 − 1 输出 JSON 数字，
+  超出的（雪花 id、订单号）输出十进制字符串——查看台与 `rtv` 用 `JSON.parse`，更大的数字会被改写（ADR 0020）；其余 Number 按 Double。
+
+## 同意与清空（0.2.0 起的语义，ADR 0019 / 0020）
+
+- **`setEnabled(false)` 跨重启有效**：落盘为 root 同级的空标记文件 `noBackupFilesDir/retriever.disabled`，直到 `setEnabled(true)`。
+  禁用 = 不写（不占 seq、不计到达率）、不传、不拉配置、不排后台作业，并取消已排的 JobScheduler 作业；调用时正在途的那一个请求不打断
+  （数据是在同意期内采集的）。调用立即返回：写入立即停，标记在 SDK 后台线程上写；标记写失败（磁盘满）时内存照样禁用、调度器定时重试——
+  在写成之前进程就死，下次启动会是启用的，所以**已撤回同意的宿主请在每次启动时、`configure` 之前调一次 `setEnabled(false)`**（幂等）。
+  `configure` 之前的调用会暂存，建实例时作为初值并落盘。只把它当「临时暂停、重启自动恢复」用的宿主：现在会一直禁用。
+- **`setEnabled(true)`**：删标记，然后排空出站箱、拉配置；标记删不掉则保持禁用（宁可不传）。
+- **`purgeLocal()` 不阻塞**：调用线程上只取消在途请求，删除与重建在 SDK 后台线程上做——返回时清空尚未完成，`installId` 还是旧值；
+  要在完成时做事用 `purgeLocal(callback: Runnable)`（回调在 SDK 后台线程上，此时 `installId` 已是新值）。回调之前写的行可能随清空一起删除。
+  清空 = root 先整个改名为同级的 `retriever.purge-<uuid>` 再删，中途被杀也不会留下半个 root；启动时清掉残留。清空不改变启用状态
+  （标记在 root 外面，「撤回 = `setEnabled(false)` + `purgeLocal()`」不会被自己撤销），禁用状态下清空之后不拉配置。
+- **多进程**：标记在所有进程之间共享——别的进程的上传 / 拉配置 / 排作业在它下一次决策时停，但它的**写入要到它自己调用 `setEnabled(false)`
+  或重启才停**。`purgeLocal` 只保证调用进程：别的进程内存里的 install 与已打开的段文件不变（写进已被删除的旧文件里的行随之丢失），
+  它们之后物化的批以各自信封里的 install_id 上报、不会被服务端隔离；它们下次启动才换到新 install。需要所有进程一起清空时，
+  在每个进程里各调一次，或清空后重启这些进程。
 
 ## 宿主必须知道的纪律
 
 - **目录**：`context.noBackupFilesDir/retriever/`（默认不进 Auto Backup，不用改宿主的备份规则）。不要自行清理；SDK 按容量（默认 20 MB，远程可调 2–100 MB）与 7 天驱逐。
 - **`log()` 落盘即返回**：每行一次 `FileOutputStream.write`（常开、`append = true`、不套 Buffered），进程被杀 / 崩溃不丢（真杀进程测试守着）。
-  可从任意线程同步调用；主线程写入处 SDK 自己包了 `StrictMode.allowThreadDiskWrites()`，开着 StrictMode 也不炸。
+  可从任意线程同步调用，SDK 的任何入口都不在宿主线程上等 SDK 自己的后台线程。写失败（磁盘满等）时该行记 `write_failed` 墓碑、
+  关掉写句柄 1 s 后再试，期间的行只计数不碰磁盘。
   `redact` 钩子在落盘前同步执行，钩子里调 `log()` 会被忽略；钩子抛异常则该行丢弃（宁丢不漏 PII）。
+- **StrictMode**：宿主线程上碰磁盘处 SDK 自己放行磁盘读写，API 26+ 另放行 unbuffered IO（`ThreadPolicy.detectAll()` 在 targetSdk ≥ 26 时
+  包含它，逐行一次小 write 恰好命中；只包 `allowThreadDiskWrites()` 不够）；SDK 自己的上传 / 拉配置请求打 `TrafficStats` 线程标签
+  （`VmPolicy.detectAll()` 同条件下包含 untagged sockets）。`ThreadPolicy` / `VmPolicy` 都 `detectAll().penaltyDeath()` 的验收在示例 app 的
+  `strictmode` 场景（模拟器）。
 - **`configure` 之前的日志**：默认进程里库自带的 `RetrieverInitProvider` 在 `Application.onCreate` 之前记下 Application context（不做 I/O），
   所以 `configure` 之前的 `log()` 也落盘。不想要这个 provider：宿主 manifest 里 `tools:node="remove"`，并保证 `configure` 在第一条日志之前。
 - **多进程**：每个进程各自的会话目录 `proc-<name>/`（`Options.processName = null` 时自动：主进程 `main`，其它取进程名 `:` 后缀）；
@@ -41,10 +67,13 @@ Java：`Retriever.configure(ctx, key)`、`Retriever.log(LogLevel.ERROR, "msg", "
   `Application.onCreate` 第一行 `configure`。
 - **后台兜底**：进后台时封段（段内有义务行）并就地排空；出站箱还有待传批就排一个一次性 **JobScheduler** 作业
   （`NETWORK_TYPE_ANY`、`setPersisted(true)`、id = `Options.jobId`，默认 `0x5254`，与宿主作业冲突时改它）；`fatal` 同样排作业。
-  作业在系统给的时机拉起进程（Doze 期间按维护窗口），里面排空出站箱后 `jobFinished`。库 manifest 合并进
-  `INTERNET`、`ACCESS_NETWORK_STATE`、`RECEIVE_BOOT_COMPLETED`（`setPersisted` 的前提）与 `RetrieverUploadJobService`（`BIND_JOB_SERVICE`）。
+  作业在系统给的时机拉起进程（Doze 期间按维护窗口），里面排空出站箱后 `jobFinished`；系统停止作业只挡当次作业的排空。禁用时不排作业。
+  库 manifest 合并进 `INTERNET`、`ACCESS_NETWORK_STATE`、`RECEIVE_BOOT_COMPLETED`（`setPersisted` 的前提）与 `RetrieverUploadJobService`（`BIND_JOB_SERVICE`）。
 - **不挂崩溃处理器**：未捕获异常由下次启动的恢复流程发现（前台死亡 → 合成 `rtv.unclean_exit` 带上下文补传）。
-  宿主自有处理器可在其中调 `Retriever.log(LogLevel.FATAL, …, error = t)`（同步物化 + 排作业）。
+  宿主自有处理器可在其中调 `Retriever.log(LogLevel.FATAL, …, error = t)`：**不阻塞**——调用线程上只写行、换段并直接排作业，
+  封段物化在 SDK 后台线程上做；进程随后死亡的话，下次启动的恢复会把这一行物化成同一个 batch_id 的批。`RetrieverLog.wtf` / Timber
+  ASSERT 同样映射到 fatal（`RetrieverLog` 先写 Retriever、再调 `Log.wtf`，后者可能直接终止进程）。
+  **fatal 只能在 Java / Kotlin 的异常处理器或普通代码里调，不能在 native signal handler 里调**（会分配内存、拿锁、做文件 I/O）。
 - **网络**：SDK 用自己的 `HttpURLConnection`（不经宿主 OkHttp / 拦截器），不缓存、超时 30 s、不跟随重定向；
   不做可达性预检（`registerDefaultNetworkCallback` 只用来提前唤醒）；任何上传（含 full_dump 的 backfill）都不看网络类型（ADR 0009）。
 - **gzip**：请求体是单成员标准 gzip（`GZIPOutputStream`），无尾随字节；文件字节即请求体，重试原样重发。
@@ -77,21 +106,30 @@ Timber.tag("billing").e(e, "purchase failed %s", sku)
 cd sdk/android
 ./example/gen-local-properties.sh      # 从仓库根 .env 的 EXAMPLE_KEY_STAGING 生成 retriever.local.properties（gitignored，不打印 key）
 ./gradlew :example:installDebug        # 装到 adb 连着的设备
-adb shell am start -n org.revdog.retriever.example/.MainActivity --es scenario error   # error | user | bulk | crash | flush
+adb shell am start -n org.revdog.retriever.example/.MainActivity --es scenario error   # error | user | bulk | crash | flush | strictmode
 ```
 
 没有 `retriever.local.properties` 时 key 为空：只写本地不上传。baseURL 默认 `https://logs-staging.revdog.org`（staging 只收 `lk_test_` key）。
 界面显示 installId / supportCode / 出站箱待传数 / 生效级别；按钮演示 `Retriever.log`、Timber、`RetrieverLog` 三种写法，以及 flush、setUser、
-崩溃恢复（`throw RuntimeException`）、5000 行压测。场景与 iOS 示例 `ScenarioRunner` 逐字对应，末尾记 warn `scenario <name> done`。
+崩溃恢复（`throw RuntimeException`）、5000 行压测。场景与 iOS 示例 `ScenarioRunner` 逐字对应，末尾记 warn `scenario <name> done`；
+`strictmode` 只有 Android 有：`ThreadPolicy`（主线程）与 `VmPolicy` 都 `detectAll().penaltyDeath()` 之后在主线程上跑 error 场景的内容，
+随后的封段与上传在 SDK 线程上发生——任何违规进程即死。
 `./gradlew :example:assembleRelease` 走 R8（本 app 没有任何 keep），顺带验证 consumer 规则。
 
 ## 协议备注（与服务端 / 另两端对齐）
 
 - `batch_id`：primary = UUIDv5(ns, `<install>:<session>:primary:<oseq_from>`)；backfill 每段一批 = `…:backfill:<seg_no>`；
-  单段超 768 KB 按 seq 切多批时 = UUIDv5(ns, `<install>:<session>:backfill:<seg_no>:<seq_from>`)。
+  单段超 768 KB 按 seq 切多批时 = UUIDv5(ns, `<install>:<session>:backfill:<seg_no>:<seq_from>`)；
+  413 切分出的半批 = UUIDv5(ns, `<install>:<session>:primary:<oseq_from>:<oseq_to>`)（install 取原批信封，全部半批写成才删原批）。
+- 请求头 `X-Rtv-Install` 取**该批信封里**的 install_id；映射只在响应 `status = stored` 且批属于当前 install 时记为已确认。
 - backfill 回传 RETAINED 段里的全部非义务行，可能与已作为 ctx 上传的行重复，读侧按 `(session_id, seq)` 去重。
+- 会话终态只为有义务行（`last_oseq > 0`）的会话写；每批带最旧的未在途 20 条终态 / 100 条墓碑，不合并、不截断，带不完留给下一批；
+  不再发 `closed_sessions_dropped`。`drops.jsonl` / `sessions.jsonl` 各自上限 1000 条（墓碑先无损合并，仍超出删最旧的未在途条目）。
 - 本地状态文件比方案 §3.2 多三处（同 iOS）：根目录 `config.json`、`cursor.json.closed_ms`、`backoff.json.last_ack_ms`。
+  0.2.0 起 `meta.json` 多一个可选键 `install_id`（install 身份的冗余副本：`install.json` 损坏时据此修复、不换 id，留 `rtv.install_repaired`；
+  找不到副本才清空重建，留 `rtv.install_reset`）；root 同级多两种文件 `retriever.disabled`、`retriever.purge-*`。0.1.x 的盘上状态全部照读。
 - 远程配置请求头另带 `X-Rtv-Local-Cap-Bytes`（宿主 `localCapBytes`）。`device.sdk` / `X-Rtv-Sdk` = `retriever-android/<ver>`。
+  配置属于请求时的身份：`setUser` 的值一变就按新身份重拉，旧身份的放大型配置立即回落，旧身份的响应到得晚也不生效。
 
 ## 与 iOS 的平台差异
 
@@ -99,7 +137,8 @@ adb shell am start -n org.revdog.retriever.example/.MainActivity --es scenario e
 |---|---|---|
 | 目录 / 备份 | Application Support + isExcludedFromBackup + 保护类别 | `noBackupFilesDir`（默认不备份） |
 | 进后台 | `beginBackgroundTask` 包住排空（过期必 end） | 就地排空 25 s 预算 + 一次性 JobScheduler 作业兜底；系统停作业 → 取消在途、不删批 |
-| fatal | 同步物化，只落盘 | 同左 + 排作业 |
+| fatal | 只落盘，封段物化异步、不等待 | 同左 + 在调用线程上排作业 |
+| 禁用标记 | root 同级 `<root>.disabled` | 同左（`noBackupFilesDir/retriever.disabled`）；另取消已排的作业 |
 | 会话目录锁 | 目录 fd 上 flock | `meta.json` 上的 `FileChannel` 锁 |
 | 根级读改写锁 | 根目录 fd 上 flock | `upload.lock` 的第 2 个字节区间（上传锁是第 1 个字节区间，同一个常开 channel） |
 | 单调时钟 | `CLOCK_MONOTONIC` | `SystemClock.elapsedRealtime()`（含深睡眠） |
@@ -114,9 +153,10 @@ adb shell am start -n org.revdog.retriever.example/.MainActivity --es scenario e
 ./gradlew :retriever:publishReleasePublicationToStagingRepository            # 发到 build/maven-staging（不联网）
 ```
 
-单测覆盖：golden 向量（ids / client_day / config clamp）、`validate-envelope.ts` 跨语言校验（原始信封字节）、gzip（`GZIPInputStream` + `gunzip -t`）、
-队列状态机、段与物化、驱逐、配置、生命周期与 JobScheduler 调度、多进程、写入纪律、UTF-8 截断、**真杀进程**
-（子 JVM 写 5000 行后 `Runtime.halt(137)`，父进程恢复；另测残行）、`log()` 1 万次 p99。
+单测覆盖：golden 向量（ids 含 413 半批 / client_day / config clamp / 整数 attrs）、`validate-envelope.ts` 跨语言校验（原始信封字节）、
+gzip（`GZIPInputStream` + `gunzip -t`）、队列状态机、段与物化、驱逐与 jsonl 上限、配置（含身份变化重拉）、生命周期与 JobScheduler 调度、
+多进程（含共享禁用标记、清空后的请求头）、写入纪律、UTF-8 截断、install 身份修复 / 清空、宿主线程不等待（fatal / purge / shutdown）、
+启用状态落盘、**真杀进程**（子 JVM 写 5000 行后 `Runtime.halt(137)`，父进程恢复；另测残行、fatal 后立即杀）、`log()` 1 万次 p99。
 
 ## 发布
 
@@ -125,10 +165,10 @@ monorepo 是唯一开发源；公开仓库 `githubYiheng/retriever-android` 只�
 （后者的门禁 3 要求公开仓库已有 tag 且树 == `HEAD:sdk/android`，保证 Maven 上的制品与 GitHub 上的源码同源）。
 
 ```bash
-scripts/sdk-android-release.sh 0.1.0                # 八道门禁 + subtree split + git push --dry-run
-scripts/sdk-android-release.sh 0.1.0 --apply        # 推 retriever-android main + tag v0.1.0
-scripts/sdk-android-maven-publish.sh 0.1.0          # 六道门禁 + Gradle 发到 staging + 列出将上传的对象
-scripts/sdk-android-maven-publish.sh 0.1.0 --apply  # wrangler 传 R2 `revdog-maven` + 回读校验
+scripts/sdk-android-release.sh 0.2.0                # 八道门禁 + subtree split + git push --dry-run
+scripts/sdk-android-release.sh 0.2.0 --apply        # 推 retriever-android main + tag v0.2.0
+scripts/sdk-android-maven-publish.sh 0.2.0          # 六道门禁 + Gradle 发到 staging + 列出将上传的对象
+scripts/sdk-android-maven-publish.sh 0.2.0 --apply  # wrangler 传 R2 `revdog-maven` + 回读校验
 ```
 
 - 源码发布八道门禁：CHANGELOG 有 `## [X.Y.Z]`；工作区干净；两个模块 JVM 单测；`scripts/api-check.sh`（metalava 基线）；
@@ -153,11 +193,34 @@ scripts/sdk-android-maven-publish.sh 0.1.0 --apply  # wrangler 传 R2 `revdog-ma
 // settings.gradle.kts → dependencyResolutionManagement.repositories
 maven { url = uri("https://maven.revdog.org/releases"); content { includeGroup("org.revdog") } }
 // 模块
-implementation("org.revdog:retriever:0.1.2")
-implementation("org.revdog:retriever-timber:0.1.2")   // 可选，宿主已用 Timber 时
+implementation("org.revdog:retriever:0.2.0")
+implementation("org.revdog:retriever-timber:0.2.0")   // 可选，宿主已用 Timber 时
 ```
 
 升级规则：修订号 = 只修 bug；次版本 = 公开 API 只增；主版本 = 公开 API 有减或改，看 CHANGELOG 迁移说明。
+
+## Google Play Data safety 申报指引
+
+表单由宿主开发者负责填写，下面是 Retriever 这一部分该怎么报（定义取自 Play 官方 [Data safety 说明](https://support.google.com/googleplay/android-developer/answer/10787469)）。
+
+- 「收集」= 数据从设备传出，**包括 app 内 SDK 传出的**；「共享」= 转给第三方，交给代开发者处理数据的「服务提供方」不算共享。
+  Retriever 后端由开发者自己运营，所以**共享：否**；第三方 app 接入时 Retriever 属于服务提供方，同样不算共享。
+
+| Play 数据类型 | SDK 里的来源 | 收集 | 共享 | 用途 |
+|---|---|---|---|---|
+| 设备或其他 ID | `install_id`（随机 UUID，随 app 数据容器；官方示例就有 "Firebase installation ID"） | 是 | 否 | Analytics |
+| 用户 ID | `setUser` 的值 | 调了才有 | 否 | Analytics（用于客服按人查询时加选 App functionality） |
+| 崩溃日志 | fatal 行、`exc.stack`、`rtv.unclean_exit` | 是 | 否 | Analytics |
+| 诊断 | 日志行、机型 / OS / locale / app 版本、墓碑 | 是 | 否 | Analytics |
+| 其他（宿主判断） | `msg` / `attrs` 里写的内容：页面点击 → App interactions；搜索词 → In-app search history；自由文本 → Other user-generated content | 视宿主 | 否 | 同上 |
+
+- **用途选 Analytics**：官方定义含 "to monitor app health, to diagnose and fix bugs or crashes"。
+- **本地内容按「可能被收集」申报**：没上传的行不算收集，但 error 附带的上下文与远程按需全量（full_dump）能带走任何一行本地日志，所以保守申报。
+- **可选 / 必需**：宿主用 `setEnabled` 做了同意开关的，可申报「可选」（用户能控制收集）；否则申报「必需」。
+- **传输加密：可勾**。默认 `https://logs.revdog.org`，且 Android 9（API 28）起默认禁明文；宿主自己配 `http://` 的 baseUrl 就不能勾。
+- **可请求删除：有条件地勾**。服务端 30 天自动删除，`rtv user purge` / 查看台能按 user / install 清除；宿主要对外提供申请渠道
+  （例如让用户报 `supportCode`）才能勾。
+- **不适用「临时处理」豁免**：数据保留 30 天。
 
 ## 脱敏（宿主建议）
 

@@ -93,7 +93,8 @@ class SegmentTests : RtvTest() {
         val before = h.transport.batchRequests.size
         h.l(LogLevel.INFO, "ctx before fatal")
         h.l(LogLevel.FATAL, "crashing")
-        // log() 返回时批已在出站箱（同步物化），且没有发起上传
+        // 封段物化在引擎线程上异步做（ADR 0020 决定 1）；做完后批在出站箱，且没有发起上传
+        h.settle()
         assertEquals(1, h.outboxFiles("p0").size)
         assertEquals(before, h.transport.batchRequests.size)
         val e = h.envelopes("p0").first()

@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.TrafficStats
 import android.os.Build
 import android.os.Bundle
 import android.os.StrictMode
@@ -17,9 +18,12 @@ import android.os.storage.StorageManager
 import android.os.SystemClock
 import org.revdog.retriever.RetrieverUploadJobService
 import org.revdog.retriever.core.Clock
+import org.revdog.retriever.core.HttpRequest
+import org.revdog.retriever.core.HttpResponse
 import org.revdog.retriever.core.Platform
 import org.revdog.retriever.core.PlatformEvent
 import org.revdog.retriever.core.PlatformEventSink
+import org.revdog.retriever.core.Transport
 import org.revdog.retriever.core.stackTraceText
 import java.io.File
 import java.io.IOException
@@ -42,8 +46,9 @@ internal object AndroidClock : Clock {
  * Android 平台层（方案 §3.9 Android 列）：
  * - 生命周期：`registerActivityLifecycleCallbacks` 计数 started activities → 前台 / 后台（配置变更重建不算）；
  * - 网络：`registerDefaultNetworkCallback` 的 onAvailable 只用来提前唤醒（不做可达性预检）；
- * - 后台兜底：框架 JobScheduler 一次性作业（网络约束、持久化；ADR 0003 决定 13，不引 WorkManager）；
- * - StrictMode：写入处 `allowThreadDiskWrites()` 包住并恢复；栈：`printStackTrace` 文本（[stackTraceText]，不用 `Log.getStackTraceString`）。
+ * - 后台兜底：框架 JobScheduler 一次性作业（网络约束、持久化；ADR 0003 决定 13，不引 WorkManager）；`setEnabled(false)` 取消它；
+ * - StrictMode：宿主线程上碰磁盘处放行磁盘读写与 unbuffered IO 并恢复；网络请求打 `TrafficStats` 标签（[TaggedTransport]）；
+ * - 栈：`printStackTrace` 文本（[stackTraceText]，不用 `Log.getStackTraceString`）。
  */
 internal class AndroidPlatform(private val app: Context) : Platform {
     @Volatile
@@ -233,11 +238,53 @@ internal class AndroidPlatform(private val app: Context) : Platform {
         }
     }
 
+    override fun cancelUploadJob(jobId: Int) {
+        try {
+            app.getSystemService(JobScheduler::class.java)?.cancel(jobId)
+        } catch (e: RuntimeException) {
+            // 绝不抛给宿主
+        }
+    }
+
     override fun stackTraceString(t: Throwable): String = stackTraceText(t)
 
-    override fun allowDiskWrites(): Any? = StrictMode.allowThreadDiskWrites()
+    /**
+     * `allowThreadDiskWrites()` 只放行磁盘读写两位；`ThreadPolicy.detectAll()` 在 targetSdk ≥ 26 时还包含 unbuffered IO
+     * （逐行一次 write 恰好命中：一个流上 > 10 次操作且累计 < 5 KB），API 26+ 另加 `permitUnbufferedIo()`（ADR 0020 决定 6）。
+     */
+    override fun allowDiskWrites(): Any? {
+        val old = StrictMode.allowThreadDiskWrites()
+        if (Build.VERSION.SDK_INT >= 26) {
+            StrictMode.setThreadPolicy(StrictMode.ThreadPolicy.Builder(StrictMode.getThreadPolicy()).permitUnbufferedIo().build())
+        }
+        return old
+    }
 
     override fun restoreDiskPolicy(token: Any?) {
         if (token is StrictMode.ThreadPolicy) StrictMode.setThreadPolicy(token)
+    }
+
+    companion object {
+        /** SDK 自己的上传 / 拉配置套接字的 `TrafficStats` 标签（宿主开 `VmPolicy.detectUntaggedSockets` 不报违规）。 */
+        const val TRAFFIC_TAG = 0x5254
+    }
+}
+
+/**
+ * 网络请求前后打 `TrafficStats` 线程标签（ADR 0020 决定 6）：`VmPolicy.detectAll()` 在 targetSdk ≥ 26 时包含
+ * untagged sockets 检查；`HttpURLConnection` 在调用线程上建连，线程标签会落到套接字上。
+ */
+internal class TaggedTransport(private val inner: Transport) : Transport {
+    override fun send(request: HttpRequest): HttpResponse? {
+        TrafficStats.setThreadStatsTag(AndroidPlatform.TRAFFIC_TAG)
+        try {
+            return inner.send(request)
+        } finally {
+            TrafficStats.clearThreadStatsTag()
+        }
+    }
+
+    override fun cancelAll() {
+        inner.cancelAll()
     }
 }

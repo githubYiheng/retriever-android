@@ -69,6 +69,21 @@ class RetrieverLogTests : RtvTest() {
         assertEquals("null", logcat[4].third)
     }
 
+    /** 先写 Retriever、再写 logcat（ADR 0020 决定 1）：`Log.wtf` 可能直接终止进程，先写 logcat 的话那一行进不了 Retriever。 */
+    @Test
+    fun wtfWritesSinkBeforeLogcat() {
+        val order = ArrayList<String>()
+        RetrieverLog.logcat = { _, _, _, _ ->
+            order.add("logcat")
+            1
+        }
+        RetrieverLog.sink = { _, _, _, _ -> order.add("sink") }
+        RetrieverLog.wtf("T", "f")
+        RetrieverLog.wtf("T", IllegalStateException("x"))
+        RetrieverLog.e("T", "e")
+        assertEquals(listOf("sink", "logcat", "sink", "logcat", "sink", "logcat"), order)
+    }
+
     @Test
     fun endToEndIntoSegmentAndNeverThrows() {
         val h = Harness(key = "")

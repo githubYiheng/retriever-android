@@ -7,7 +7,8 @@ import java.io.IOException
 import java.io.RandomAccessFile
 
 // 启动恢复（§3.4 ORPHAN）：旧会话截残行、判退出、unclean_fg 合成 error 并按 error 封段带 ctx、
-// 旧会话终态写 sessions.jsonl；旧 session_id / user_id / device 一律取持久化值；
+// 旧会话终态写 sessions.jsonl（只为 last_oseq > 0 的会话写）；零行的会话目录直接删；段读不出的会话本次不动、下次重试
+// （ADR 0019 决定 1 / 13）；旧 session_id / user_id / device 一律取持久化值；
 // cursor = max(cursor 文件, 出站箱里本会话最大 oseq_to)。与 iOS `Recovery.swift` 逐字一致。
 
 private val UNCLEAN_TAG = Bytes.ascii("\"tag\":\"rtv.unclean_exit\"")
@@ -63,7 +64,9 @@ private fun Engine.recoverOne(
     val files = ArrayList<SegmentFile>()
     for ((_, isOpen, n) in segNames) {
         val file = File(dir, n)
-        val f = Segments.read(file, isOpen) ?: continue
+        // 段读不出（I/O 错误）：本次不动这个会话——不推进 cursor、不删目录、不写终态，下次启动重试（ADR 0019 决定 13）。
+        // 跳过它继续的话，没读到的义务行会被当成「不在盘上」、cursor 被推过，无墓碑消失
+        val f = Segments.read(file, isOpen) ?: return meta
         if (isOpen && f.validEnd < f.data.size) {
             // 截残行：回到最后一个完整行
             Fs.truncate(file, f.validEnd.toLong())
@@ -94,11 +97,21 @@ private fun Engine.recoverOne(
     val tombMax = existingDrops.filter { it.sessionId == sid }.maxOfOrNull { it.oseqTo } ?: 0
     maxOseq = maxOf(maxOseq, cursor.extractedThroughOseq, tombMax)
 
+    if (maxSeq == 0L && maxOseq == 0L) {
+        // 零行（盘上无行、也没有任何已物化 / 已驱逐 / 墓碑的痕迹；Android 后台拉起的空进程多是这样）：无数据、无终态可写，
+        // 直接删目录（ADR 0019 决定 1），不留到 7 天年龄驱逐、也不在每次冷启动重读。
+        // 判零行在合成 rtv.unclean_exit 之前：禁用期间启动的会话必是零行，不能事后由已启用的进程替它合成一条带时刻的崩溃证据
+        // 上报（撤回同意 = 不写不传，ADR 0020 决定 2）；代价是启用期「一行未写就前台崩溃」不留痕
+        Fs.remove(dir)
+        return meta
+    }
+
+    val newTombs = ArrayList<DropEntry>()
+    var exit = SessionExit.UNKNOWN
     if (cursor.closedMs == null) {
         // 缺口（残行、全 0 块、未落盘的 write_failed）计 corrupt 墓碑；已有墓碑覆盖的不重复记
         val covered = existingDrops.filter { it.sessionId == sid }
         fun isCovered(o: Long) = covered.any { it.oseqFrom <= o && o <= it.oseqTo }
-        val newTombs = ArrayList<DropEntry>()
         var o = cursor.extractedThroughOseq + 1
         while (o <= maxOseq) {
             if (o in present || isCovered(o)) {
@@ -110,7 +123,7 @@ private fun Engine.recoverOne(
             newTombs.add(DropEntry(sid, start, o, o - start + 1, DropReason.CORRUPT, now, lastAckAge(now)))
             o += 1
         }
-        val exit = when (cursor.lastState) {
+        exit = when (cursor.lastState) {
             "fg" -> SessionExit.UNCLEAN_FG
             "bg" -> SessionExit.CLEAN_BG
             else -> SessionExit.UNKNOWN
@@ -118,7 +131,8 @@ private fun Engine.recoverOne(
         val lastFile = files.lastOrNull()
         val lastLine = lastFile?.lines?.lastOrNull()
         val alreadySynth = lastLine != null && Bytes.contains(UNCLEAN_TAG, lastFile.data, lastLine.start, lastLine.end)
-        if (exit == SessionExit.UNCLEAN_FG && !alreadySynth) {
+        // 合成行也是写入：只看本进程内存开关（禁用 = 不写，ADR 0020 决定 2）
+        if (exit == SessionExit.UNCLEAN_FG && !alreadySynth && enabled) {
             val oblig = LogLevel.ERROR.rank >= effective.uploadLevel.rank
             val seq = maxSeq + 1
             val oseq = if (oblig) maxOseq + 1 else 0
@@ -146,19 +160,29 @@ private fun Engine.recoverOne(
                 }
             }
         }
+    }
+
+    if (cursor.closedMs == null) {
         val rec = SessionRecord(meta, dir, cursor, sealAll(files).toMutableList())
-        if (sid !in existingClosed) {
+        // 终态只为有义务行的会话写（ADR 0019 决定 1）：last_oseq = 0 的会话服务端无可结算，写了只会挤占有数据会话的终态
+        val closedOk = if (sid !in existingClosed && maxOseq > 0) {
             val c = ClosedSession(
                 sid, meta.sessionNo, meta.startedMs, maxOf(maxTs, cursor.lastStateMs, meta.startedMs), maxSeq, maxOseq,
                 exit,
             )
-            locks.withDirLock { Fs.append(sessionsFile, Jsonl.encodeClosed(listOf(c))) }
+            appendClosed(listOf(c))
+        } else {
+            true
         }
-        if (newTombs.isNotEmpty()) appendDrops(newTombs)
-        // 按 error 封段带 ctx（合成 error 在批内 → 自动附 ctx）
-        materialize(rec, maxOseq, maxSeq, false, true)
-        rec.cursor.closedMs = now
-        writeCursor(rec)
+        val dropsOk = if (newTombs.isEmpty()) true else appendDrops(newTombs)
+        // 按 error 封段带 ctx（合成 error 在批内 → 自动附 ctx）。墓碑没写成就不物化：物化会把 cursor 推过缺口，下次启动的
+        // 缺口扫描从 cursor + 1 开始就再也找不到它；整个会话留到下次启动重试（同 ADR 0019 决定 13 的做法）
+        if (dropsOk) materialize(rec, maxOseq, maxSeq, false, true)
+        // 终态或墓碑没写成（磁盘满等）：不打「已收尾」标记，下次启动重试收尾（合成行有防重复），不静默丢终态
+        if (closedOk && dropsOk) {
+            rec.cursor.closedMs = now
+            writeCursor(rec)
+        }
         register(rec)
     } else {
         val rec = SessionRecord(meta, dir, cursor, sealAll(files).toMutableList())

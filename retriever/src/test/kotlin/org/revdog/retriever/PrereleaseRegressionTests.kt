@@ -94,13 +94,19 @@ class PrereleaseRegressionTests : RtvTest() {
         assertTrue(bad.isDirectory)
     }
 
+    /**
+     * 「无副本」前提（ADR 0019 决定 8）：会话 meta.json 都没了（或都是 0.1.x 写的、不带 install_id）时 install.json 损坏 →
+     * 容器无法归属，清空 root 新建 install，留 `rtv.install_reset`（attrs 带作废数量）。有副本时走修复、不换 id，见 StateOwnershipTests。
+     */
     @Test
     fun a1_corruptInstallJsonRebuiltWithSyntheticLine() {
         for (bad in listOf("{\"install_id\":\"not-a-uuid".toByteArray(), ByteArray(0))) {
             val h = Harness(key = "")
             h.settle()
             val old = h.client.installId!!
+            val oldSid = h.client.writer.currentSessionId
             h.client.simulateCrash()
+            for (d in File(h.root, "proc-main").listFiles()!!) File(d, "meta.json").delete()
             File(h.root, "install.json").writeBytes(bad)
             val h2 = Harness(root = h.root, key = "", clock = h.clock)
             h2.settle()
@@ -112,9 +118,11 @@ class PrereleaseRegressionTests : RtvTest() {
             assertEquals(iid, inst["install_id"])
             assertEquals("计数器从 0 起再 +1", 1L, int(inst["session_counter"]))
             assertTrue(h2.client.supportCode!!.endsWith("-1"))
+            assertFalse("旧会话随 root 清掉", File(File(h2.root, "proc-main"), oldSid).exists())
             val reset = segLines(h2.client.debugOpenSegmentFile!!).single { it["tag"] == "rtv.install_reset" }
             assertEquals("warn", reset["level"])
-            assertEquals("install.json unreadable; install_id regenerated", reset["msg"])
+            assertEquals("install.json unreadable; local state discarded", reset["msg"])
+            assertEquals(mapOf("batches" to 0.0, "sessions" to 1.0), reset["attrs"])
             assertEquals(true, reset["synthetic"])
             assertEquals("默认上传级别下是义务行", 1L, int(reset["oseq"]))
             // 随新 install_id 的批上报

@@ -3,6 +3,10 @@ package org.revdog.retriever.core
 import org.revdog.retriever.LogException
 import org.revdog.retriever.LogLevel
 import org.revdog.retriever.LogLine
+import java.math.BigDecimal
+import java.math.BigInteger
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 
 /**
@@ -116,8 +120,11 @@ internal object LineEncoder {
     }
 
     /**
-     * attrs：键按字典序；≤ 32 键；贪心装入直到序列化 ≤ 4096 B。值：String / Boolean / null 原样，
-     * Number 按 JS 数字格式（非有限数转 "NaN" / "Infinity" / "-Infinity"），其它 `toString()`。
+     * attrs：键按字典序；≤ 32 键；贪心装入直到序列化 ≤ 4096 B。值：String / Boolean / null 原样；
+     * 整数型（Byte / Short / Int / Long / AtomicInteger / AtomicLong / BigInteger / 无小数位的 BigDecimal）|v| ≤ 2^53 − 1
+     * 输出 JSON 数字、超出输出十进制字符串（ADR 0020 决定 3，golden `attrs.json`；值没丢，不打 truncated）；
+     * 其余 Number 按 JS 数字格式（非有限数转 "NaN" / "Infinity" / "-Infinity"）；其它 `toString()`。
+     * 字符串先按预算截再转义：UTF-16 长度超过预算的键 / 值转义后必然超预算，直接跳过，不整串转义（超长值不做数倍分配）。
      * 返回 (JSON 或 null, 是否截断)。
      */
     fun encodeAttrs(attrs: Map<String, Any?>): Pair<ByteArray?, Boolean> {
@@ -138,25 +145,29 @@ internal object LineEncoder {
         out.byte(0x7B)
         var count = 0
         for (k in keys) {
+            val v = attrs[k]
+            val text = when (v) {
+                null, is Boolean, is Number -> null
+                is String -> v
+                else -> v.toString()
+            }
+            // 一个 UTF-16 单元至少 1 个 UTF-8 字节：长度超过预算的键 / 字符串值放不下，先判再转义
+            if (k.length > Limits.LINE_ATTRS_BYTES || (text != null && text.length > Limits.LINE_ATTRS_BYTES)) {
+                truncated = true
+                continue
+            }
             val item = JsonOut(32)
             if (count > 0) item.raw(",")
             item.string(k)
             item.raw(":")
-            when (val v = attrs[k]) {
+            when (v) {
                 null -> item.raw("null")
-                is String -> item.string(v)
                 is Boolean -> item.bool(v)
-                is Number -> {
-                    val d = v.toDouble()
-                    if (d.isNaN()) {
-                        item.string("NaN")
-                    } else if (d.isInfinite()) {
-                        item.string(if (d > 0) "Infinity" else "-Infinity")
-                    } else {
-                        item.number(d)
-                    }
-                }
-                else -> item.string(v.toString())
+                is Byte, is Short, is Int, is Long, is AtomicInteger, is AtomicLong -> integer(item, (v as Number).toLong())
+                is BigInteger -> integer(item, v)
+                is BigDecimal -> if (v.scale() <= 0) integer(item, v.toBigInteger()) else number(item, v)
+                is Number -> number(item, v)
+                else -> item.string(text ?: "")
             }
             if (out.size + item.size + 1 > Limits.LINE_ATTRS_BYTES) {
                 truncated = true
@@ -168,6 +179,29 @@ internal object LineEncoder {
         if (count == 0) return Pair(null, truncated || attrs.isNotEmpty())
         out.byte(0x7D)
         return Pair(out.toByteArray(), truncated)
+    }
+
+    /** 2^53 − 1：JS `Number.MAX_SAFE_INTEGER`，查看端 `JSON.parse` 能精确表示的最大整数。 */
+    private const val MAX_SAFE_INTEGER = 9_007_199_254_740_991L
+    private val MAX_SAFE_BIG: BigInteger = BigInteger.valueOf(MAX_SAFE_INTEGER)
+
+    private fun integer(o: JsonOut, v: Long) {
+        if (v in -MAX_SAFE_INTEGER..MAX_SAFE_INTEGER) o.int(v) else o.string(v.toString())
+    }
+
+    private fun integer(o: JsonOut, v: BigInteger) {
+        if (v.abs() <= MAX_SAFE_BIG) o.raw(v.toString()) else o.string(v.toString())
+    }
+
+    private fun number(o: JsonOut, v: Number) {
+        val d = v.toDouble()
+        if (d.isNaN()) {
+            o.string("NaN")
+        } else if (d.isInfinite()) {
+            o.string(if (d > 0) "Infinity" else "-Infinity")
+        } else {
+            o.number(d)
+        }
     }
 
     fun build(

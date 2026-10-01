@@ -67,10 +67,13 @@ internal interface Platform {
     /** 排一个一次性后台上传作业（JobScheduler：网络约束、持久化）。已有同 id 作业在排 / 在跑则不动。 */
     fun scheduleUploadJob(jobId: Int)
 
+    /** 取消排着的后台上传作业（`setEnabled(false)`，ADR 0020 决定 2）。 */
+    fun cancelUploadJob(jobId: Int)
+
     /** Throwable → 栈文本（Android：[stackTraceText]）。 */
     fun stackTraceString(t: Throwable): String
 
-    /** 写入处放行磁盘 I/O（Android：`StrictMode.allowThreadDiskWrites()`），返回旧策略令牌。 */
+    /** 宿主线程上碰磁盘处放行 StrictMode（Android：磁盘读写 + API 26+ 的 unbuffered IO），返回旧策略令牌。 */
     fun allowDiskWrites(): Any?
 
     fun restoreDiskPolicy(token: Any?)

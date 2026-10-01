@@ -19,7 +19,13 @@ internal class ResponseEffect {
 internal class ConfigEffect {
     var sealed = false
     var backfill = false
+
+    /** 响应属于请求时的身份，而身份已经变了：丢弃不生效，调用方重拉（ADR 0019 决定 12）。 */
+    var stale = false
 }
+
+/** 配置请求与请求时的身份 (install_id, user_id)：响应只在身份未变时生效。 */
+internal class ConfigFetch(val request: HttpRequest, val installId: String, val userId: String?)
 
 /**
  * 选下一批：p0 > p1 > p2，同级 created_ms 升序（失败过的批让到后面，避免头阻塞）；单在途；相邻请求 ≥ 2 s；
@@ -28,9 +34,10 @@ internal class ConfigEffect {
 internal fun Engine.nextSend(): SendStep {
     val nowMono = clock.monoMs()
     if (key.isEmpty()) return SendStep.Stop("not_configured", null)
-    if (!enabled) return SendStep.Stop("disabled", null)
+    // 本进程内存开关 ∧ 盘上无禁用标记（别的进程禁用也在这里挡住，ADR 0020 决定 2）
+    if (!uploadAllowed()) return SendStep.Stop("disabled", null)
     // 未 bootstrap（install.json 写不进 / 读不了）：不碰磁盘直接停，bootstrap 成功后由 startup 重新排空
-    val inst = install ?: return SendStep.Stop("not_bootstrapped", null)
+    if (install == null) return SendStep.Stop("not_bootstrapped", null)
     if (!effective.config.uploadEnabled) return SendStep.Stop("upload_disabled", null)
     val pauseActive = backoff.pausedUntilMono > nowMono
     if (pauseActive && "all" in backoff.pausedCategories) return SendStep.Stop("paused", backoff.pausedUntilMono)
@@ -63,7 +70,8 @@ internal fun Engine.nextSend(): SendStep {
                 "Authorization" to "Bearer $key",
                 "Content-Type" to "application/json",
                 "Content-Encoding" to "gzip",
-                "X-Rtv-Install" to inst.installId,
+                // 每个批以自身信封里的 install_id 上报（ADR 0019 决定 10）：多进程清空窗口里别的 install 的批不被隔离
+                "X-Rtv-Install" to pick.installId,
                 "X-Rtv-Sent-Ms" to clock.wallMs().toString(),
                 "X-Rtv-Sdk" to sdkHeader,
             ),
@@ -99,7 +107,7 @@ internal fun Engine.handleResponse(name: String, response: HttpResponse?): Respo
         in 200..299 -> {
             // 回显的 batch_id 与本批一致才算确认（防 captive portal）；stored 与 quarantined 都算
             if (body != null && (body["batch_id"] as? String) == meta.batchId) {
-                ack(meta)
+                ack(meta, (body["status"] as? String) == "stored")
                 eff.acked = true
                 val e = body["config_etag"] as? String
                 if (e != null && e != (configCache?.config?.etag ?: "")) eff.fetchConfig = true
@@ -110,7 +118,8 @@ internal fun Engine.handleResponse(name: String, response: HttpResponse?): Respo
         // 只有服务端明确表态（JSON 对象且 reason 是字符串，未知值也算）才鉴权暂停；边缘 / WAF / captive portal
         // 替服务端回的 401 / 403（HTML、空体、无 reason）按「其它」退避并计 fail（ADR 0011）
         401, 403 -> if (body?.get("reason") is String) authPause() else failure(name, null, "http_${response.status}", true)
-        413 -> split413(name)
+        // 切分写不出（磁盘满等）：原批保留，按普通失败退避（不计毒批，批本身没错），免得每 2 s 重发一次再 413
+        413 -> if (!split413(name)) failure(name, null, "http_413", false)
         429 -> categoryPause(body, response.headers["retry-after"])
         503 -> failure(name, retryAfter(body, response.headers["retry-after"]), "http_503", false)
         else -> failure(name, null, "http_${response.status}", true)
@@ -138,7 +147,7 @@ internal fun backoffMs(attempt: Int): Long {
     return jitter(base)
 }
 
-private fun Engine.ack(meta: BatchMeta) {
+private fun Engine.ack(meta: BatchMeta, stored: Boolean) {
     val nowWall = clock.wallMs()
     Fs.remove(File(outboxDir, meta.name))
     metas.remove(meta.name)
@@ -165,9 +174,12 @@ private fun Engine.ack(meta: BatchMeta) {
     }
     val d = meta.mappingDigest
     if (meta.hasMapping && d != null) {
-        val m = MappingState(meta.mappingUser, d, nowWall)
-        mapping = m
-        Fs.writeAtomic(mappingFile, m.encode())
+        // 服务端只在 stored 时写映射：被隔离的批不算映射已确认；别的 install 的批也不算本 install 的（ADR 0019 决定 10）
+        if (stored && meta.installId == install?.installId) {
+            val m = MappingState(meta.mappingUser, d, nowWall)
+            mapping = m
+            Fs.writeAtomic(mappingFile, m.encode())
+        }
         val p = pendingMapping
         if (p != null && p.user == meta.mappingUser && p.digest == d) pendingMapping = null
     }
@@ -230,7 +242,7 @@ private fun Engine.categoryPause(body: Map<String, Any?>?, header: String?) {
 
 /** 排空的下一次唤醒（退避 / 暂停到期）。 */
 internal fun Engine.uploadWakeMono(): Long? {
-    if (key.isEmpty() || !enabled || !effective.config.uploadEnabled) return null
+    if (key.isEmpty() || !uploadAllowed() || !effective.config.uploadEnabled) return null
     if (metas.values.none { it.prio < 3 }) return null
     val now = clock.monoMs()
     val w = ArrayList<Long>()
@@ -243,9 +255,14 @@ internal fun Engine.uploadWakeMono(): Long? {
 
 // MARK: 远程配置（§5）
 
-internal fun Engine.configRequest(): HttpRequest? {
-    if (key.isEmpty()) return null
+/**
+ * 配置请求（null = 不拉：没 key、没 bootstrap、或已禁用——禁用期间零联网，ADR 0020 决定 2）。
+ * 带上请求时的身份 (install_id, user_id)，响应据此判断还属不属于当前身份。
+ */
+internal fun Engine.configRequest(): ConfigFetch? {
+    if (key.isEmpty() || !uploadAllowed()) return null
     val inst = install ?: return null
+    val user = writer.currentUser
     val h = linkedMapOf(
         "Authorization" to "Bearer $key",
         "X-Rtv-Install" to inst.installId,
@@ -257,10 +274,10 @@ internal fun Engine.configRequest(): HttpRequest? {
         "X-Rtv-Local-Cap-Bytes" to host.localCapBytes.toString(),
     )
     // 值一律 percent-encode（ASCII 字母数字以外全部编码，服务端 decodeURIComponent）
-    writer.currentUser?.let { h["X-Rtv-User"] = percentEncode(it) }
+    user?.let { h["X-Rtv-User"] = percentEncode(it) }
     // 发起即记「上次尝试时刻」：请求在途期间轮询候选不再是过去时（否则调度器以 0 ms 自旋到响应回来）
     lastConfigFetchMono = clock.monoMs()
-    return HttpRequest("GET", endpoint("v1/config"), h, null)
+    return ConfigFetch(HttpRequest("GET", endpoint("v1/config"), h, null), inst.installId, user)
 }
 
 internal fun percentEncode(s: String): String {
@@ -278,9 +295,13 @@ internal fun percentEncode(s: String): String {
     return sb.toString()
 }
 
-/** 拉到配置：钳制后缓存并生效；拉不到 / 非 200 / 非对象 → 用缓存（不放大）。 */
-internal fun Engine.applyConfigResponse(r: HttpResponse?): ConfigEffect {
+/**
+ * 拉到配置：钳制后缓存并生效；拉不到 / 非 200 / 非对象 → 用缓存（不放大）。配置属于请求时的身份（ADR 0019 决定 12）：
+ * 请求发出后 install_id 或 user_id 变了 → 丢弃（`stale`），调用方按新身份重拉。
+ */
+internal fun Engine.applyConfigResponse(fetch: ConfigFetch, r: HttpResponse?): ConfigEffect {
     lastConfigFetchMono = clock.monoMs()
+    if (fetch.installId != install?.installId || fetch.userId != writer.currentUser) return ConfigEffect().apply { stale = true }
     if (r == null || r.status != 200) return ConfigEffect()
     val o = JsonIn.obj(r.body) ?: return ConfigEffect()
     val cfg = ConfigRules.clamp(o, host)
@@ -313,6 +334,15 @@ internal fun Engine.applyEffective(): ConfigEffect {
     }
     if (old.config.localCapBytes != effective.config.localCapBytes) evictIfNeeded()
     return eff
+}
+
+/**
+ * 身份（setUser 的值）变了：缓存里的配置属于上一个身份，按过期处理——放大型字段立即回落保守默认（U-2 同一路径），
+ * 直到新身份的响应到达（ADR 0019 决定 12）。
+ */
+internal fun Engine.identityChanged(): ConfigEffect {
+    configCache = configCache?.staleForIdentity()
+    return applyEffective()
 }
 
 internal fun Engine.configPollDue(nowMono: Long): Boolean {

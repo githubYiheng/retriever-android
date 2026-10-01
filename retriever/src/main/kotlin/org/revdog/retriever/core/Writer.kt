@@ -23,8 +23,9 @@ internal class FailedRange(val from: Long, var to: Long, var n: Long, val atMs: 
 
 /**
  * 写入侧（宪法 R-1，方案 §3.3 / §3.4）：常开 `FileOutputStream(file, true)`（不套 Buffered），锁内只做
- * 「seq++（义务行 oseq++）+ 拼前缀 + 一次 write」。逐行不 sync；写失败 `RandomAccessFile.setLength` 回上一完整行、
- * 该行照常占 seq / oseq 并记内存墓碑 write_failed；绝不抛给宿主。与 iOS `Writer.swift` 逐字一致。
+ * 「seq++（义务行 oseq++）+ 拼前缀 + 一次 write」。逐行不 sync；写失败 `RandomAccessFile.setLength` 回上一完整行（不 sync）、
+ * 关掉写句柄按 1 s 节流重开（ADR 0020 决定 6），该行照常占 seq / oseq 并记内存墓碑 write_failed；绝不抛给宿主。
+ * 与 iOS `Writer.swift` 逐字一致。
  */
 internal class Writer(private val clock: Clock) {
     class Outcome {
@@ -34,6 +35,9 @@ internal class Writer(private val clock: Clock) {
         var deadlineChanged = false
         var tombstone = false
     }
+
+    /** setUser 的结果：`changed` = 值变了（身份变化，要重拉配置）；`rotated` = 因此封了段。 */
+    class UserChange(val changed: Boolean, val rotated: Boolean)
 
     private val lock = ReentrantLock()
 
@@ -58,10 +62,11 @@ internal class Writer(private val clock: Clock) {
 
     // MARK: 会话
 
-    /** 开始（或重开）一个会话：seq / oseq 从 0 起，打开 seg-000001.open。 */
+    /** 开始（或重开）一个会话：关掉上一个会话的流（含没封完的段），seq / oseq 从 0 起，打开 seg-000001.open。 */
     fun startSession(dir: File, sessionId: String) {
         lock.withLock {
             closeQuietly(out)
+            for (j in pending) closeQuietly(j.out)
             out = null
             sessionDir = dir
             this.sessionId = sessionId
@@ -135,7 +140,7 @@ internal class Writer(private val clock: Clock) {
         if (!enabled || !(forced || level.rank >= localRank) || sessionDir == null) return res
         val now = clock.monoMs()
         if (out == null && now >= nextReopenMono) {
-            if (!openSegmentLocked(if (cur.segNo == 0) 1 else cur.segNo)) nextReopenMono = now + 1000
+            if (!reopenLocked()) nextReopenMono = now + REOPEN_THROTTLE_MS
         }
         seq += 1
         val oblig = forced || level.rank >= uploadRank
@@ -153,7 +158,13 @@ internal class Writer(private val clock: Clock) {
             } catch (e: IOException) {
                 false
             }
-            if (!ok) Fs.truncate(cur.file, cur.bytes)
+            if (!ok) {
+                // 回到上一完整行；关掉写句柄，节流期内的行不再碰磁盘（磁盘满时不让每次 log() 都做一轮 I/O）
+                Fs.truncate(cur.file, cur.bytes)
+                closeQuietly(o)
+                out = null
+                nextReopenMono = now + REOPEN_THROTTLE_MS
+            }
         }
         if (!ok) {
             if (oblig) {
@@ -176,7 +187,7 @@ internal class Writer(private val clock: Clock) {
         }
         if (forced) return res
         if (level == LogLevel.FATAL) {
-            // fatal：立即封段并物化（调用方在锁外同步处理，只落盘不尝试上传）
+            // fatal：立即换段；封段物化由调用方投递到引擎线程、不等待（ADR 0020 决定 1），只落盘不尝试上传
             if (rotateLocked(SealReason.FATAL, false)) {
                 res.rotated = true
                 res.fatal = true
@@ -233,11 +244,23 @@ internal class Writer(private val clock: Clock) {
         return true
     }
 
-    /** 锁内换段：当前段（有行才换）交给引擎线程封，立即打开下一段。 */
+    /**
+     * 写失败之后重开：段里已有行就接着追加（失败时已截回上一完整行，header 不重写）；还没有行则按新段重开。
+     */
+    private fun reopenLocked(): Boolean {
+        if (cur.segNo == 0 || cur.lineCount == 0) return openSegmentLocked(if (cur.segNo == 0) 1 else cur.segNo)
+        out = try {
+            FileOutputStream(cur.file, true)
+        } catch (e: IOException) {
+            null
+        }
+        return out != null
+    }
+
+    /** 锁内换段：当前段（有行才换；写句柄已因写失败关掉也照封）交给引擎线程封，立即打开下一段。 */
     private fun rotateLocked(reason: SealReason, noCtx: Boolean): Boolean {
-        val o = out ?: return false
-        if (cur.lineCount <= 0) return false
-        pending.add(SealJob(o, cur, reason, noCtx, seq, oseq))
+        if (sessionDir == null || cur.lineCount <= 0) return false
+        pending.add(SealJob(out, cur, reason, noCtx, seq, oseq))
         if (cur.hasError) lastErrorSealMono = clock.monoMs()
         errorDeadline = null
         warnDeadline = null
@@ -255,9 +278,12 @@ internal class Writer(private val clock: Clock) {
         rotateLocked(reason, false)
     }
 
-    /** setUser：值变化即封段；当前段还没有行时直接改写 header（用户边界 = 段边界）。 */
-    fun setUser(u: String?): Boolean = lock.withLock {
-        if (u == user) return@withLock false
+    /**
+     * setUser：值变化即封段；当前段还没有行时直接改写 header（用户边界 = 段边界）。
+     * 返回「值变了」与「封了段」两件事：身份变化与是否封段无关（ADR 0019 决定 12）。
+     */
+    fun setUser(u: String?): UserChange = lock.withLock {
+        if (u == user) return@withLock UserChange(false, false)
         user = u
         val o = out
         if (o != null && cur.lineCount == 0) {
@@ -271,14 +297,15 @@ internal class Writer(private val clock: Clock) {
             if (ok) {
                 cur.userId = u
                 cur.bytes = header.size.toLong()
-                return@withLock false
+                return@withLock UserChange(true, false)
             }
         }
-        if (out == null) {
+        if (out == null && cur.lineCount == 0) {
+            // 段还没开成（或写失败后关了）且没有行：重开时按新 user 写 header
             cur.userId = u
-            return@withLock false
+            return@withLock UserChange(true, false)
         }
-        rotateLocked(SealReason.USER, false)
+        UserChange(true, rotateLocked(SealReason.USER, false))
     }
 
     /** 定时器：error 去抖到期 / warn 计时到期（仅当有义务行）。 */
@@ -336,5 +363,10 @@ internal class Writer(private val clock: Clock) {
         } catch (e: IOException) {
             // 忽略
         }
+    }
+
+    private companion object {
+        /** 段打不开 / 写失败之后多久再试一次（期间的行只计数记墓碑，不碰磁盘）。 */
+        const val REOPEN_THROTTLE_MS = 1000L
     }
 }

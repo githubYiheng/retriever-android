@@ -76,7 +76,6 @@ internal fun Engine.materialize(s: SessionRecord, targetOseq: Long, targetSeq: L
         if (extras != null) {
             h.drops = extras.drops
             h.closedSessions = extras.closed
-            h.closedSessionsDropped = extras.dropped
         }
         if (withMapping) h.mapping = MappingBlock(user, s.meta.device)
         return h.encodePrefix().size + 2
@@ -190,7 +189,6 @@ internal fun Engine.materialize(s: SessionRecord, targetOseq: Long, targetSeq: L
         if (c.extras) {
             h.drops = extras.drops
             h.closedSessions = extras.closed
-            h.closedSessionsDropped = extras.dropped
             usedExtras = true
         }
         if (c.mapping) h.mapping = MappingBlock(c.user, s.meta.device)
@@ -218,35 +216,15 @@ internal fun Engine.needMapping(user: String?, digest: String, now: Long): Boole
 }
 
 /**
- * 取本批要带的 drops（≤ 100，超出按 reason 合并）与 closed_sessions（≤ 20，更旧的合并为计数）。
- * 条目留在 jsonl 里直到携带它的批 2xx；在途的用内存集合排除，避免重复携带。
+ * 取本批要带的 drops（≤ 100）与 closed_sessions（≤ 20）：按文件顺序取最旧的、未在途的前 N 条；携带不改写文件、
+ * 不合并、不计数，带不完的留给下一批（ADR 0019 决定 2）。条目留在 jsonl 里直到携带它的批 2xx；在途的用内存集合排除，避免重复携带。
  */
 internal fun Engine.takeExtras(): Extras = locks.withDirLock {
-    var drops = readDropsLocked()
-    var avail = drops.filter { it !in embeddedDrops }
-    if (avail.size > Limits.DROPS_PER_BATCH) {
-        val merged = Engine.mergeDrops(avail, Limits.DROPS_PER_BATCH)
-        val embedded = drops.filter { it in embeddedDrops }
-        drops = embedded + merged
-        Fs.writeAtomic(dropsFile, Jsonl.encodeDrops(drops))
-        avail = merged
-    }
-    val takeDrops = avail.take(Limits.DROPS_PER_BATCH)
-    embeddedDrops.addAll(takeDrops)
-
-    val closed = readClosedLocked()
-    var availC = closed.filter { it.sessionId !in embeddedClosed }
-    var dropped = 0L
-    if (availC.size > Limits.CLOSED_SESSIONS_PER_BATCH) {
-        availC = availC.sortedBy { it.endedMs }
-        val older = availC.take(availC.size - Limits.CLOSED_SESSIONS_PER_BATCH)
-        dropped = older.size.toLong()
-        val olderIds = older.map { it.sessionId }.toSet()
-        Fs.writeAtomic(sessionsFile, Jsonl.encodeClosed(closed.filter { it.sessionId !in olderIds }))
-        availC = availC.takeLast(Limits.CLOSED_SESSIONS_PER_BATCH)
-    }
-    embeddedClosed.addAll(availC.map { it.sessionId })
-    Extras(takeDrops, availC, dropped)
+    val drops = readDropsLocked().filter { it !in embeddedDrops }.take(Limits.DROPS_PER_BATCH)
+    embeddedDrops.addAll(drops)
+    val closed = readClosedLocked().filter { it.sessionId !in embeddedClosed }.take(Limits.CLOSED_SESSIONS_PER_BATCH)
+    embeddedClosed.addAll(closed.map { it.sessionId })
+    Extras(drops, closed)
 }
 
 internal fun Engine.releaseExtras(e: Extras) {
@@ -296,7 +274,7 @@ internal fun batchMeta(name: String, h: EnvelopeHeader, lines: List<ByteArray>, 
     val prio = OutboxName.parse(name)?.prio ?: 1
     val m = h.mapping
     return BatchMeta(
-        name, prio, h.createdMs, h.batchId, h.kind, h.sessionId, h.oseqFrom ?: 0, h.oseqTo ?: 0, lines.size, warn, err,
+        name, prio, h.createdMs, h.batchId, h.installId, h.kind, h.sessionId, h.oseqFrom ?: 0, h.oseqTo ?: 0, lines.size, warn, err,
         h.drops, h.closedSessions, m != null, m?.userId, m?.let { Engine.digest(it.device) }, bytes,
     )
 }

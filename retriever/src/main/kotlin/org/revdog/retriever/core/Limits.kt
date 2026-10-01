@@ -63,8 +63,14 @@ internal object Limits {
 
 /** 方案正文里有、limits.ts 未收录的客户端数字（§3.2 / §3.6 / §3.7 / §3.8）。与 iOS `ClientConstants` 同值。 */
 internal object ClientConstants {
-    /** §3.8 `drops.jsonl` 自身上限，超出按 reason 合并。 */
+    /**
+     * §3.8 `drops.jsonl` 与 `sessions.jsonl` 各自的条数上限（ADR 0019 决定 3 / 4）：墓碑先做无损合并，仍超出删最旧的未在途条目；
+     * 终态超出删最旧的未在途条目。
+     */
     const val DROPS_FILE_MAX_ENTRIES = 1000
+
+    /** 禁用标记没写成时的重试间隔（ADR 0020 决定 2：每次调度 tick 重试，这里保证有 tick）。与 iOS `markerRetryMs` 同值。 */
+    const val MARKER_RETRY_MS = 60_000L
 
     /** §3.8 可用空间余量。 */
     const val DISK_RESERVE_BYTES = 64L * 1024 * 1024

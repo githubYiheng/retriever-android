@@ -148,6 +148,43 @@ class WriteDisciplineTests : RtvTest() {
         assertEquals(2, readSegment(f).size)
     }
 
+    /**
+     * 写失败之后关掉写句柄、按 1 s 节流重开（ADR 0020 决定 6）：节流期内的行只计数记墓碑、不碰磁盘；
+     * 重开时接着原段追加（已写的行不丢、header 不重写），seq / oseq 连续。旧实现句柄坏了之后每一行都失败（并逐行 fsync）。
+     */
+    @Test
+    fun writeFailureClosesHandleAndReopensThrottled() {
+        val h = Harness(key = "")
+        h.settle()
+        h.client.log(LogLevel.WARN, "ok 1")
+        val f = h.client.debugOpenSegmentFile!!
+        h.client.writer.debugBreakStream()
+        h.client.log(LogLevel.WARN, "lost 2")
+        assertNull("失败后句柄关掉", h.client.debugOpenSegmentFile)
+        h.client.log(LogLevel.WARN, "lost 3 (throttled)")
+        h.clock.advance(999)
+        h.client.log(LogLevel.WARN, "lost 4 (throttled)")
+        h.clock.advance(1)
+        h.client.log(LogLevel.WARN, "ok 5")
+        assertEquals(f, h.client.debugOpenSegmentFile)
+        val ls = readSegment(f)
+        assertEquals(3, ls.size)
+        assertEquals(listOf("ok 1", "ok 5"), ls.drop(1).map { JsonIn.obj(it)!!["msg"] })
+        assertEquals(listOf(1L, 5L), ls.drop(1).map { int(JsonIn.obj(it)!!["oseq"]) })
+        h.work { it.flushTombstones() }
+        val drops = h.readJsonl("drops.jsonl")
+        assertEquals(1, drops.size)
+        assertEquals(listOf(2L, 4L, 3L), listOf(int(drops[0]["oseq_from"]), int(drops[0]["oseq_to"]), int(drops[0]["n"])))
+        // 句柄关着时也照常封段（用户边界不跨段）
+        h.client.writer.debugBreakStream()
+        h.client.log(LogLevel.WARN, "lost 6")
+        h.client.setUser("u2")
+        h.settle()
+        val envs = h.envelopes()
+        assertEquals(listOf("ok 1", "ok 5"), envs.flatMap { it.lines }.sortedBy { int(it["seq"]) }.map { it["msg"] })
+        assertTrue("旧用户的行不挂到新用户名下", envs.all { it["user_id"] == null })
+    }
+
     @Test
     fun concurrentLoggingKeepsSeqUnique() {
         val h = Harness(key = "")

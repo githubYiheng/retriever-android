@@ -6,6 +6,7 @@ import org.revdog.retriever.LogLevel
 import org.revdog.retriever.LogLine
 import org.revdog.retriever.Options
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutionException
@@ -26,7 +27,10 @@ import kotlin.concurrent.withLock
  * 并发模型（与 iOS RetrieverClient 同构）：
  * - 热路径 `log()` 只碰 [Writer]（ReentrantLock，锁内一次 write），不进引擎线程、不等待任何后台工作；
  * - 其余一切磁盘状态（封段、物化、出站箱、驱逐、恢复、配置、队列决策）在单线程引擎执行器上（也承担定时器）；
- * - 网络在引擎线程外：排空循环在 net 线程、配置拉取 / flush 等待 / 后台排空在 aux 线程，发送前后各回引擎线程一次。
+ * - 网络在引擎线程外：排空循环在 net 线程、配置拉取 / flush 等待 / 后台排空在 aux 线程，发送前后各回引擎线程一次；
+ * - 宿主线程永不等待 SDK 后台线程（ADR 0020 决定 1）：fatal、purgeLocal、shutdown 都是投递后立即返回。
+ *
+ * `initialEnabled`：`configure` 之前宿主调过的 `setEnabled`（暂存值），作为初值并落盘；null = 按盘上标记。
  */
 internal class RetrieverClient(
     val root: File,
@@ -36,6 +40,7 @@ internal class RetrieverClient(
     val clock: Clock,
     val transport: Transport,
     val platform: Platform,
+    initialEnabled: Boolean? = null,
 ) : PlatformEventSink {
     val processName: String = sanitizeProcessName(options.processName ?: platform.autoProcessName())
     val writer = Writer(clock)
@@ -61,6 +66,10 @@ internal class RetrieverClient(
     @Volatile
     var onInternalError: ((Throwable) -> Unit)? = null
 
+    /** 宿主在本实例上最后一次显式 setEnabled 的值（null = 没调过；初值 = 构造时的 `initialEnabled`）；换进程名时带给新实例。 */
+    @Volatile
+    var requestedEnabled: Boolean? = initialEnabled
+
     /** 锁保护的调度 / 排空 / 作业状态。 */
     class Control {
         val lock = ReentrantLock()
@@ -74,10 +83,21 @@ internal class RetrieverClient(
         val drainWaiters = ArrayList<CountDownLatch>()
         var lastStopReason = ""
         var lastStopWake: Long? = null
+
+        /** 本进程正在跑后台作业（[runUploadJob] 开始到结束）。 */
+        var jobRunning = false
+
+        /** 系统停止了当次作业：只挡当次作业的排空，作业结束即复位（ADR 0020 决定 6）。 */
         var stopRequested = false
+
+        /** 进行中的 purgeLocal 个数（已调用、还没做完）：> 0 时排空在每次取批前检查并退出、不拉配置（ADR 0020 决定 1）。 */
+        var purging = 0
         var timer: ScheduledFuture<*>? = null
         var timerTarget: Long? = null
         var configFetching = false
+
+        /** 身份变了而配置请求在途：在途结束后再拉一次（ADR 0019 决定 12）。 */
+        var configRefetch = false
         var tombstoneScheduled = false
         var closed = false
 
@@ -89,6 +109,10 @@ internal class RetrieverClient(
 
     init {
         ctl.redact = options.redact
+        // 启用状态在同步 bootstrap 之前定下（暂存值优先，否则看盘上标记），写入立即按它生效；暂存值在引擎线程上落盘
+        val on = initialEnabled ?: !engine.disabledMarked()
+        writer.setEnabled(on)
+        engine.enabled = on
         // 同步建会话：构造返回后 log() 立即落盘
         val ok = engine.bootstrap()
         ctl {
@@ -97,12 +121,14 @@ internal class RetrieverClient(
             sessionNo = engine.current?.meta?.sessionNo ?: 0
         }
         platform.startObserving(this)
+        if (initialEnabled != null) workAsync { persistEnabled() }
         workAsync { startup() }
     }
 
     // MARK: 启动（引擎线程）
 
     private fun startup() {
+        engine.removePurgeLeftovers()
         if (!ctl { bootstrapped }) return
         engine.scanOutboxAtStartup()
         engine.recoverOldSessions()
@@ -145,16 +171,17 @@ internal class RetrieverClient(
         val enc = LineEncoder.encode(line)
         val token = platform.allowDiskWrites()
         val out = try {
-            writer.append(line.level, enc.body)
+            val o = writer.append(line.level, enc.body)
+            // fatal：进程随后可能立即死亡，兜底补传作业在调用线程上直接排（标记的 stat 也在 StrictMode 放行范围内）
+            if (o.fatal && fatalJobArmed()) platform.scheduleUploadJob(jobId)
+            o
         } finally {
             platform.restoreDiskPolicy(token)
         }
         if (out.fatal) {
-            // fatal：立即封段并物化，只落盘不尝试上传；排一个后台作业兜底补传
-            onWork {
-                engine.processSeals()
-                if (engine.hasUploadWork()) platform.scheduleUploadJob(jobId)
-            }
+            // fatal：调用线程上只写行与换段，封段物化投递到引擎线程、不等待（ADR 0020 决定 1）——行在 log() 返回前已交给内核，
+            // 进程死了由下次启动的恢复物化出同一个 batch_id。只落盘不尝试上传
+            workAsync { engine.processSeals() }
             return
         }
         if (out.rotated) {
@@ -182,15 +209,24 @@ internal class RetrieverClient(
         }
     }
 
+    /** fatal 在调用线程上排后台作业的条件：key 非空、已启用（内存开关 ∧ 无标记）、远程 upload_enabled。 */
+    private fun fatalJobArmed(): Boolean =
+        engine.key.isNotEmpty() && writer.isEnabled && engine.effective.config.uploadEnabled && !engine.disabledMarked()
+
+    /** 登录 / 登出：值变化即封段；身份变了（与是否封段无关）→ 配置缓存按过期处理并立即按新身份重拉（ADR 0019 决定 12）。 */
     fun setUser(id: String?) {
         safely {
             val token = platform.allowDiskWrites()
-            val rotated = try {
+            val ch = try {
                 writer.setUser(Text.sanitizeUserId(id))
             } finally {
                 platform.restoreDiskPolicy(token)
             }
-            if (rotated) workAsync { afterSeal() }
+            if (ch.rotated) workAsync { afterSeal() }
+            if (ch.changed) {
+                workAsync { if (engine.identityChanged().sealed) kickDrain() }
+                fetchConfig(refetch = true)
+            }
         }
     }
 
@@ -290,53 +326,132 @@ internal class RetrieverClient(
         }
     }
 
-    /** 生效的上传 / 本地级别（远程配置钳制后；适配器早过滤用）。 */
-    val effectiveLevels: Pair<LogLevel, LogLevel> get() = writer.levels
-
-    fun setEnabled(enabled: Boolean) {
-        safely {
-            writer.setEnabled(enabled)
-            workAsync {
-                engine.enabled = enabled
-                if (enabled) kickDrain()
+    private fun deliver(callback: Runnable) {
+        try {
+            aux.execute {
+                try {
+                    callback.run()
+                } catch (t: Throwable) {
+                    report(t)
+                }
             }
+        } catch (t: Throwable) {
+            report(t)
         }
     }
 
-    /** 删 root 下全部内容并重建 install.json（新 install_id）与新会话。 */
-    fun purgeLocal() {
+    /** 生效的上传 / 本地级别（远程配置钳制后；适配器早过滤用）。 */
+    val effectiveLevels: Pair<LogLevel, LogLevel> get() = writer.levels
+
+    /**
+     * 用户同意 / 撤回（ADR 0020 决定 2）：先改本进程内存开关（写入立即停 / 恢复），落盘在引擎线程上——
+     * false：写 root 同级标记、取消排着的后台作业（在途的那一个请求不取消）；true：删标记后排空、拉配置，删不掉则保持禁用。
+     */
+    fun setEnabled(enabled: Boolean) {
         safely {
+            requestedEnabled = enabled
+            writer.setEnabled(enabled)
+            workAsync { persistEnabled() }
+        }
+    }
+
+    /** 本进程的启用状态（内存开关；启动时由盘上标记初始化）。 */
+    val isEnabled: Boolean get() = writer.isEnabled
+
+    /** 引擎线程：把内存开关的当前值落到盘上（连着调几次只按最后一次的值落盘）。 */
+    private fun persistEnabled() {
+        if (writer.isEnabled) {
+            val marked = engine.disabledMarked()
+            if (!engine.clearDisabledMarker()) {
+                // 标记删不掉：保持禁用（宁可不传，也不误传）
+                writer.setEnabled(false)
+                engine.enabled = false
+                return
+            }
+            val was = engine.enabled && !marked
+            engine.enabled = true
+            if (!was) {
+                kickDrain()
+                fetchConfig()
+            }
+        } else {
+            engine.enabled = false
+            engine.markDisabled()
+            // 在跑的作业不取消：它的排空在下一次选批时停在 disabled，在途的那一个请求照常完成、不被打断
+            if (!ctl { jobRunning }) platform.cancelUploadJob(jobId)
+        }
+        reschedule()
+    }
+
+    /**
+     * 清空本地（ADR 0019 决定 9 / ADR 0020 决定 1）：调用线程上只取消在途请求并置「清空中」（排空每次取批前检查并退出），
+     * 删除与重建投递到引擎线程，立即返回；做完后在 SDK 后台线程上调 [callback]（此时 installId 已是新值）。
+     * 不碰禁用标记（它在 root 外面）；禁用状态下清空后不拉配置。
+     */
+    fun purgeLocal(callback: Runnable?) {
+        ctl { purging += 1 }
+        try {
             transport.cancelAll()
-            onWork {
-                writer.abandonSession()
-                engine.releaseUploadLock()
-                engine.releaseSessionLock()
-                engine.locks.close()
-                for (name in Fs.list(root)) Fs.remove(File(root, name))
-                engine.metas.clear()
-                engine.embeddedDrops.clear()
-                engine.embeddedClosed.clear()
-                engine.pendingMapping = null
-                engine.mapping = null
-                engine.others.clear()
-                engine.fails.clear()
-                engine.inFlight = null
-                engine.backoff = BackoffState()
-                engine.ackedRanges.clear()
-                engine.backfilledSegs.clear()
-                engine.configCache = null
-                engine.lastConfigFetchMono = null
-                engine.install = null
-                engine.current = null
-                val ok = engine.bootstrap()
-                ctl {
-                    bootstrapped = ok
-                    installId = engine.install?.installId
-                    sessionNo = engine.current?.meta?.sessionNo ?: 0
+            work.execute {
+                try {
+                    purgeNow()
+                } catch (t: Throwable) {
+                    report(t)
+                } finally {
+                    ctl { purging -= 1 }
+                    // 新 install 的配置：有在途请求也要在它结束后再拉一次（在途的那份属于旧身份，会被丢弃）
+                    fetchConfig(refetch = true)
+                    callback?.let { deliver(it) }
                 }
             }
-            fetchConfig()
+        } catch (t: Throwable) {
+            report(t)
+            ctl { purging -= 1 }
+            callback?.let { deliver(it) }
         }
+    }
+
+    /**
+     * 引擎线程：root 先改名移走（与 install.json 无副本时的清空同一实现），bootstrap 新 root（新 install_id，写入切到新会话），
+     * 最后才删移走的旧 root——删除只在替代者建好之后。其间 log() 照常写进旧会话（随旧 root 删掉，设计如此），不空返回。
+     */
+    private fun purgeNow() {
+        engine.releaseUploadLock()
+        engine.releaseSessionLock()
+        engine.locks.close()
+        // 先改名再删：一步原子，中途被杀也不会新旧状态混用。改名失败（极少见，如 root 所在目录只读）时退回逐项删除——
+        // 宁可失去原子性也要把本地数据清掉（与 iOS 同口径）；原地删之前先放弃当前会话，免得写入在要删的目录里再建段
+        val moved = engine.moveRootAside()
+        if (moved == null && root.exists()) {
+            report(IOException("purgeLocal: cannot move ${root.path} aside; deleting in place"))
+            writer.abandonSession()
+            for (name in Fs.list(root)) Fs.remove(File(root, name))
+        }
+        engine.metas.clear()
+        engine.embeddedDrops.clear()
+        engine.embeddedClosed.clear()
+        engine.pendingMapping = null
+        engine.mapping = null
+        engine.others.clear()
+        engine.fails.clear()
+        engine.inFlight = null
+        engine.backoff = BackoffState()
+        engine.ackedRanges.clear()
+        engine.backfilledSegs.clear()
+        engine.configCache = null
+        engine.lastConfigFetchMono = null
+        engine.install = null
+        engine.current = null
+        // bootstrap 里 writer.startSession 关掉旧会话的流、切到新会话
+        val ok = engine.bootstrap()
+        // 新 root 没建成：不再往旧会话写（同未 bootstrap 的状态，由 retryBootstrap 重试），旧状态照删
+        if (!ok) writer.abandonSession()
+        ctl {
+            bootstrapped = ok
+            installId = engine.install?.installId
+            sessionNo = engine.current?.meta?.sessionNo ?: 0
+        }
+        moved?.let { Fs.remove(it) }
     }
 
     val installId: String? get() = ctl { installId }
@@ -362,22 +477,25 @@ internal class RetrieverClient(
         }
     }
 
-    /** 旧实例收尾（进程名变化时由共享实例替换）：封段、物化、放锁、停调度。 */
+    /**
+     * 旧实例收尾（进程名变化时由共享实例替换）：换段后立即返回，封段物化与放锁投递到引擎线程、不等待（ADR 0020 决定 1）。
+     * 新旧实例在同一 root 下的不同 proc-*，出站箱与 upload.lock 本来就按多进程设计。
+     */
     fun shutdown() {
         safely {
             writer.rotate(SealReason.SHUTDOWN)
-            onWork {
-                engine.processSeals()
-                engine.releaseUploadLock()
-                engine.releaseSessionLock()
-            }
-            writer.abandonSession()
             ctl {
                 closed = true
                 timer?.cancel(false)
                 timer = null
             }
             platform.stopObserving(this)
+            workAsync {
+                engine.processSeals()
+                writer.abandonSession()
+                engine.releaseUploadLock()
+                engine.releaseSessionLock()
+            }
             work.shutdown()
         }
     }
@@ -412,7 +530,6 @@ internal class RetrieverClient(
             when (event) {
                 PlatformEvent.DID_ENTER_BACKGROUND -> enterBackground()
                 PlatformEvent.WILL_ENTER_FOREGROUND -> {
-                    ctl { stopRequested = false }
                     workAsync {
                         engine.setLastState("fg")
                         engine.applyEffective()
@@ -435,10 +552,9 @@ internal class RetrieverClient(
 
     /**
      * 进后台：封段（段内有义务行）+ 排空；出站箱有待传批时排一个一次性 JobScheduler 作业兜底
-     * （进程在后台被杀 / 冻结后，系统在有网时把我们拉起来补传）。
+     * （进程在后台被杀 / 冻结后，系统在有网时把我们拉起来补传）。禁用时不排作业。
      */
     private fun enterBackground() {
-        ctl { stopRequested = false }
         val token = platform.allowDiskWrites()
         try {
             writer.rotate(SealReason.BACKGROUND, onlyIfObligation = true)
@@ -460,7 +576,10 @@ internal class RetrieverClient(
 
     /** JobScheduler 作业：排空出站箱（拿 upload.lock，不与在途重复），结束时回调是否需要系统按退避重排。 */
     fun runUploadJob(budgetMs: Long, done: (Boolean) -> Unit) {
-        ctl { stopRequested = false }
+        ctl {
+            jobRunning = true
+            stopRequested = false
+        }
         try {
             aux.execute {
                 var reschedule = false
@@ -474,6 +593,11 @@ internal class RetrieverClient(
                 } catch (t: Throwable) {
                     report(t)
                 } finally {
+                    // 停止标志只对当次作业的排空生效（ADR 0020 决定 6）：作业一结束就复位，不挡之后的排空
+                    ctl {
+                        jobRunning = false
+                        stopRequested = false
+                    }
                     try {
                         done(reschedule)
                     } catch (t: Throwable) {
@@ -483,16 +607,25 @@ internal class RetrieverClient(
             }
         } catch (t: Throwable) {
             report(t)
+            ctl {
+                jobRunning = false
+                stopRequested = false
+            }
             done(false)
         }
     }
 
-    /** 系统停止作业：取消在途请求（不删批），让排空循环尽快退出。 */
+    /** 系统停止作业：挡住当次作业的排空、取消在途请求（不删批）；作业已经结束时（迟到的回调）什么都不做。 */
     fun stopUploadJob() {
         safely {
-            ctl { stopRequested = true }
-            transport.cancelAll()
-            workAsync { engine.releaseUploadLock() }
+            val running = ctl {
+                if (jobRunning) stopRequested = true
+                jobRunning
+            }
+            if (running) {
+                transport.cancelAll()
+                workAsync { engine.releaseUploadLock() }
+            }
         }
     }
 
@@ -588,9 +721,12 @@ internal class RetrieverClient(
     private fun drainLoop() {
         while (true) {
             while (true) {
-                if (ctl { stopRequested }) {
+                val halt = ctl {
+                    if (purging > 0) "purging" else if (stopRequested) "background_expired" else null
+                }
+                if (halt != null) {
                     ctl {
-                        lastStopReason = "background_expired"
+                        lastStopReason = halt
                         lastStopWake = null
                     }
                     break
@@ -604,6 +740,15 @@ internal class RetrieverClient(
                     break
                 }
                 val send = step as SendStep.Send
+                if (ctl { purging > 0 }) {
+                    // 取批之后、发出之前清空开始了：这一批要随 root 一起清掉，不发
+                    onWork { if (engine.inFlight == send.name) engine.inFlight = null }
+                    ctl {
+                        lastStopReason = "purging"
+                        lastStopWake = null
+                    }
+                    break
+                }
                 val resp = transport.send(send.request)
                 val eff = onWork { engine.handleResponse(send.name, resp) }
                 if (eff.fetchConfig) fetchConfig()
@@ -613,7 +758,7 @@ internal class RetrieverClient(
                 reschedule()
             }
             val again = ctl {
-                if (rekick && !stopRequested) {
+                if (rekick && !stopRequested && purging == 0) {
                     rekick = false
                     true
                 } else {
@@ -629,9 +774,17 @@ internal class RetrieverClient(
 
     // MARK: 配置
 
-    fun fetchConfig() {
+    /**
+     * 拉配置（同一时刻最多一个在途）。`refetch`：身份变了——有在途请求时置「待重拉」，在途结束后再拉一次；
+     * 响应到达时身份已变（stale）同样再拉一次（ADR 0019 决定 12）。禁用时 [configRequest] 返回 null，不联网。
+     * 清空进行中不拉（清空做完时会再调一次）。
+     */
+    fun fetchConfig(refetch: Boolean = false) {
         val go = ctl {
-            if (configFetching || closed) {
+            if (closed || purging > 0) {
+                false
+            } else if (configFetching) {
+                if (refetch) configRefetch = true
                 false
             } else {
                 configFetching = true
@@ -641,20 +794,27 @@ internal class RetrieverClient(
         if (!go) return
         try {
             aux.execute {
+                var again = false
                 try {
-                    val req = onWork { engine.configRequest() }
-                    if (req != null) {
-                        val resp = transport.send(req)
-                        val eff = onWork { engine.applyConfigResponse(resp) }
+                    val fetch = onWork { engine.configRequest() }
+                    if (fetch != null) {
+                        val resp = transport.send(fetch.request)
+                        val eff = onWork { engine.applyConfigResponse(fetch, resp) }
                         if (eff.sealed) kickDrain()
+                        again = eff.stale
                     } else {
                         onWork { engine.lastConfigFetchMono = clock.monoMs() }
                     }
                 } catch (t: Throwable) {
                     report(t)
                 } finally {
-                    ctl { configFetching = false }
-                    workAsync { reschedule() }
+                    again = ctl {
+                        configFetching = false
+                        val r = (again || configRefetch) && purging == 0
+                        configRefetch = false
+                        r
+                    }
+                    if (again) fetchConfig() else workAsync { reschedule() }
                 }
             }
         } catch (t: Throwable) {
@@ -671,7 +831,9 @@ internal class RetrieverClient(
         val cands = ArrayList<Long>()
         writer.nextDeadline?.let { cands.add(it) }
         engine.uploadWakeMono()?.let { cands.add(it) }
-        if (engine.key.isNotEmpty()) cands.add((engine.lastConfigFetchMono ?: nowMono) + Limits.CONFIG_POLL_INTERVAL_S * 1000L)
+        if (engine.key.isNotEmpty() && engine.enabled) cands.add((engine.lastConfigFetchMono ?: nowMono) + Limits.CONFIG_POLL_INTERVAL_S * 1000L)
+        // 禁用标记没写成：保证 60 s 内有一次 tick 重试（禁用时没有拉配置的 tick）
+        if (engine.markerPending && !engine.enabled) cands.add(nowMono + ClientConstants.MARKER_RETRY_MS)
         engine.configCache?.nextChangeMono(nowWall, nowMono)?.let { cands.add(it) }
         engine.nextQuarantineReleaseMono()?.let { cands.add(it) }
         val next = cands.minOrNull()
@@ -693,6 +855,8 @@ internal class RetrieverClient(
             timer = null
             timerTarget = null
         }
+        // 禁用标记上次没写成：每次 tick 重试
+        if (engine.markerPending && !engine.enabled) engine.markDisabled()
         if (writer.checkDeadlines()) engine.processSeals()
         engine.applyEffective()
         engine.releaseQuarantine(false)
@@ -703,7 +867,7 @@ internal class RetrieverClient(
 
     // MARK: 执行器工具
 
-    /** 在引擎线程上同步执行（已在引擎线程上则直接执行）。 */
+    /** 在引擎线程上同步执行（已在引擎线程上则直接执行）。只给 SDK 自己的后台线程与测试用，宿主线程上的入口一律不用它。 */
     fun <T> onWork(body: () -> T): T {
         if (onEngineThread.get() == true) return body()
         val f = work.submit(Callable { body() })

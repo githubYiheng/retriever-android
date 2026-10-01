@@ -89,6 +89,19 @@ internal object Ids {
         return uuidv5(NAMESPACE, "$installId:$sessionId:backfill:$segNo:$seqFrom")
     }
 
+    /** 413 半批：`${install_id}:${session_id}:primary:${oseq_from}:${oseq_to}`（packages/core `splitBatchIdName`）。 */
+    fun splitBatchIdName(installId: String, sessionId: String, oseqFrom: Long, oseqTo: Long): String =
+        "$installId:$sessionId:primary:$oseqFrom:$oseqTo"
+
+    /**
+     * 413 切分出的半批 batch_id（ADR 0019 决定 11；golden `ids.json` `split_batch_id`）：区间两端都进名字，必与未切分批
+     * （名字以 oseq_from 结尾）不同名，重切得到同名批。install_id 取原批信封。输入不合规（非 UUID、区间不是 1 ≤ from ≤ to）返回 null。
+     */
+    fun splitBatchId(installId: String, sessionId: String, oseqFrom: Long, oseqTo: Long): String? {
+        if (!isUuid(installId) || !isUuid(sessionId) || oseqFrom < 1 || oseqTo < oseqFrom) return null
+        return uuidv5(NAMESPACE, splitBatchIdName(installId, sessionId, oseqFrom, oseqTo))
+    }
+
     /** 新的随机 UUID（v4，小写）。 */
     fun newV4(): String = UUID.randomUUID().toString()
 }

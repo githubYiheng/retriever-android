@@ -46,19 +46,21 @@ public object RetrieverLog {
     @JvmStatic
     public fun wtf(tag: String?, tr: Throwable?): Int = emit(Log.ASSERT, LogLevel.FATAL, tag, null, tr)
 
-    /** msg 为 null（Java 的 `e.getMessage()`）：logcat 照 `Log` 的习惯写 "null"；Retriever 里有异常取 `tr.toString()`。 */
+    /**
+     * 先写 Retriever、再写 logcat（ADR 0020 决定 1）：`Log.wtf` 按系统配置可能直接终止进程，先写 logcat 的话那一行就进不了 Retriever。
+     * msg 为 null（Java 的 `e.getMessage()`）：logcat 照 `Log` 的习惯写 "null"；Retriever 里有异常取 `tr.toString()`。
+     */
     private fun emit(priority: Int, level: LogLevel, tag: String?, msg: String?, tr: Throwable?): Int {
-        val n = try {
-            logcat(priority, tag, if (msg == null && tr != null) "" else msg.toString(), tr)
-        } catch (e: RuntimeException) {
-            0
-        }
         try {
             sink(level, if (msg.isNullOrEmpty() && tr != null) tr.toString() else msg ?: "", tag, tr)
         } catch (e: RuntimeException) {
             // 绝不抛给宿主
         }
-        return n
+        return try {
+            logcat(priority, tag, if (msg == null && tr != null) "" else msg.toString(), tr)
+        } catch (e: RuntimeException) {
+            0
+        }
     }
 
     private fun defaultLogcat(priority: Int, tag: String?, msg: String, tr: Throwable?): Int = when (priority) {

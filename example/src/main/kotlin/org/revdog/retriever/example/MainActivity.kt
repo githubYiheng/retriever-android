@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.StrictMode
 import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
@@ -141,9 +142,18 @@ class MainActivity : Activity() {
         )
     }
 
-    /** 演示用：直接数出站箱里的 p*.gz（布局见方案 §3.2；宿主 app 不需要这么做）。 */
-    private fun outboxPending(): Int =
-        File(noBackupFilesDir, "retriever/outbox").list()?.count { it.startsWith("p") && it.endsWith(".gz") } ?: 0
+    /**
+     * 演示用：直接数出站箱里的 p*.gz（布局见方案 §3.2；宿主 app 不需要这么做）。主线程上的磁盘读自己放行 StrictMode：
+     * `strictmode` 场景之后主线程带着 detectAll + penaltyDeath，示例自己的读盘不能把验收搅乱。
+     */
+    private fun outboxPending(): Int {
+        val old = StrictMode.allowThreadDiskReads()
+        try {
+            return File(noBackupFilesDir, "retriever/outbox").list()?.count { it.startsWith("p") && it.endsWith(".gz") } ?: 0
+        } finally {
+            StrictMode.setThreadPolicy(old)
+        }
+    }
 
     companion object {
         const val EXTRA_SCENARIO = "scenario"

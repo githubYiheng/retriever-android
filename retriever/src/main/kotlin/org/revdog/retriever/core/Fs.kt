@@ -16,6 +16,10 @@ import java.util.concurrent.locks.ReentrantLock
  * - 状态文件一律 tmp → `FileDescriptor.sync()` → `renameTo`；段文件常开 `FileOutputStream(file, true)`，不套任何 Buffered。
  */
 internal object Fs {
+    /** 测试注入点：非 null 时 [append] 只写前 n 字节就抛 IOException（模拟追加写到一半失败）。生产恒为 null。 */
+    @Volatile
+    var appendFaultForTesting: Int? = null
+
     fun ensureDir(f: File): Boolean = f.isDirectory || f.mkdirs() || f.isDirectory
 
     fun exists(f: File): Boolean = f.exists()
@@ -25,6 +29,13 @@ internal object Fs {
     }
 
     fun list(dir: File): List<String> = dir.list()?.toList() ?: emptyList()
+
+    /** 列目录，区分「不是目录（空表）」与「是目录却列不出（null）」：身份修复要靠后者判断「本次失败、稍后重试」。 */
+    fun listStrict(dir: File): List<String>? {
+        if (!dir.exists()) return emptyList()
+        if (!dir.isDirectory) return emptyList()
+        return dir.list()?.toList()
+    }
 
     fun read(f: File): ByteArray? = try {
         if (f.isFile) f.readBytes() else null
@@ -59,20 +70,34 @@ internal object Fs {
         return true
     }
 
-    /** 追加一段字节（一次 write）；文件不存在则创建。 */
-    fun append(f: File, bytes: ByteArray): Boolean = try {
-        FileOutputStream(f, true).use { it.write(bytes) }
-        true
-    } catch (e: IOException) {
-        false
+    /**
+     * 追加一段字节（一次 write）；文件不存在则创建。失败时截回追加前的长度（ADR 0019 决定 5）：
+     * 否则半行会与下一次追加的行粘连，两条一起在读侧被丢掉。
+     */
+    fun append(f: File, bytes: ByteArray): Boolean {
+        val before = if (f.isFile) f.length() else 0L
+        return try {
+            FileOutputStream(f, true).use { out ->
+                val cut = appendFaultForTesting
+                if (cut != null && cut < bytes.size) {
+                    out.write(bytes, 0, cut)
+                    throw IOException("injected partial append")
+                }
+                out.write(bytes)
+            }
+            true
+        } catch (e: IOException) {
+            if (f.isFile && f.length() > before) truncate(f, before)
+            false
+        }
     }
 
-    /** 截断到 size（写失败回到上一完整行 / 截残行）。 */
+    /**
+     * 截断到 size（写失败回到上一完整行 / 截残行 / 追加失败回滚）。不 sync（ADR 0020 决定 6）：写失败路径在宿主线程上，
+     * 逐行本来就不 fsync；恢复时截残行之后封段会 sync 一次。
+     */
     fun truncate(f: File, size: Long): Boolean = try {
-        RandomAccessFile(f, "rw").use { raf ->
-            raf.setLength(size)
-            raf.fd.sync()
-        }
+        RandomAccessFile(f, "rw").use { raf -> raf.setLength(size) }
         true
     } catch (e: IOException) {
         false

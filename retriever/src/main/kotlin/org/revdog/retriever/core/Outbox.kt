@@ -61,10 +61,10 @@ internal fun Engine.reconcileOutbox() {
         if (metas[name] == null) {
             val m = loadMeta(name)
             metas[name] = m
-                ?: // 读不出（位腐烂等）：保守当作含 warn 的 primary，交给服务端隔离
+                ?: // 读不出（位腐烂等）：保守当作含 warn 的 primary，交给服务端隔离；请求头的 install 只能取当前值
                 BatchMeta(
-                    name, p.prio, p.createdMs, p.batchId, Ids.BatchKind.PRIMARY, "", 0, 0, 0, true, p.prio == 0,
-                    emptyList(), emptyList(), false, null, null, Fs.size(File(outboxDir, name)) ?: 0,
+                    name, p.prio, p.createdMs, p.batchId, install?.installId ?: "", Ids.BatchKind.PRIMARY, "", 0, 0, 0, true,
+                    p.prio == 0, emptyList(), emptyList(), false, null, null, Fs.size(File(outboxDir, name)) ?: 0,
                 )
         }
     }
@@ -92,10 +92,12 @@ internal fun Engine.scanOutboxAtStartup() {
     val today = Day.fromMs(nowWall)
     todayDay = today
     todayCount = 0
+    val iid = install?.installId
     for (m in metas.values) {
         embeddedDrops.addAll(m.drops)
         embeddedClosed.addAll(m.closed.map { it.sessionId })
-        if (m.hasMapping && m.mappingDigest != null) pendingMapping = PendingMapping(m.mappingUser, m.mappingDigest)
+        // 别的 install 的批（多进程清空的窗口里写进来的）带的映射不算本 install 的在途映射
+        if (m.hasMapping && m.mappingDigest != null && m.installId == iid) pendingMapping = PendingMapping(m.mappingUser, m.mappingDigest)
         if (m.prio <= 1 && Day.fromMs(m.createdMs) == today) todayCount += 1
     }
 }
@@ -149,17 +151,23 @@ internal fun Engine.nextQuarantineReleaseMono(): Long? {
     return best
 }
 
-// MARK: 413：按 oseq（或 ctx）二分重物化（新的确定性 batch_id），原批删除
+// MARK: 413：按 oseq（或 ctx）二分重物化，全部半批提交后才删原批（ADR 0019 决定 11）
 
 private class SplitLine(val raw: ByteArray, val seq: Long, val oseq: Long, val ts: Long, val rank: Int, val ctx: Boolean)
 
-internal fun Engine.split413(name: String) {
+/**
+ * 切分 = 重物化：每个半批都是新名字的新批（batch_id = UUIDv5(ns, `<install>:<session>:primary:<oseq_from>:<oseq_to>`)，
+ * install 取原批信封，created_ms 沿用原批——重切得到同名同字节的文件，可重入）。全部半批提交后才删原批；任一半写失败 →
+ * 删掉本次已写的半批、原批原样保留，返回 false（调用方按普通失败退避，下次再发再 413 再切）。
+ * 「单个义务行 + 上下文折半」只产出一个文件，同样用上面的名字（再次折半时与上一次同名、原子覆盖）。
+ */
+internal fun Engine.split413(name: String): Boolean {
     val file = File(outboxDir, name)
     val gz = Fs.read(file)
     val p = gz?.let { parseBatch(it) }
     if (p == null || p.header.kind != Ids.BatchKind.PRIMARY) {
         quarantine(name)
-        return
+        return true
     }
     val ls = ArrayList<SplitLine>()
     for (raw in p.lines) {
@@ -193,26 +201,42 @@ internal fun Engine.split413(name: String) {
         parts.add(Pair(ha, oblig + ctx))
     } else {
         quarantine(name)
-        return
+        return true
     }
     val written = ArrayList<String>()
     for ((h0, part) in parts) {
         val lines = part.sortedBy { it.seq }
-        val inst = install ?: continue
-        val bid = Ids.batchId(inst.installId, h0.sessionId, Ids.BatchKind.PRIMARY, h0.oseqFrom ?: continue) ?: continue
-        val hh = h0.copy(
-            batchId = bid, seqFrom = lines.first().seq, seqTo = lines.last().seq,
-            day = Day.clientDay(lines.minOf { it.ts }, h0.createdMs),
-        )
+        val bid = Ids.splitBatchId(h0.installId, h0.sessionId, h0.oseqFrom ?: 0, h0.oseqTo ?: 0)
+        if (bid == null) {
+            // 信封身份不合规（推导不出确定性 id）：切不了，交给服务端隔离（与 iOS 同口径）
+            rollbackSplit(written, name)
+            quarantine(name)
+            return true
+        }
+        val hh = h0.copy(batchId = bid, seqFrom = lines.first().seq, seqTo = lines.last().seq, day = Day.clientDay(lines.minOf { l -> l.ts }, h0.createdMs))
         val hasErr = lines.any { !it.ctx && it.rank >= Level.ERROR }
-        writeBatch(hh, lines.map { it.raw }, if (hasErr) 0 else 1)?.let { written.add(it.name) }
+        val m = writeBatch(hh, lines.map { l -> l.raw }, if (hasErr) 0 else 1)
+        if (m == null) {
+            rollbackSplit(written, name)
+            return false
+        }
+        written.add(m.name)
     }
-    if (written.size != parts.size) return
     if (name !in written) {
         Fs.remove(file)
         metas.remove(name)
     }
     fails.remove(name)
+    return true
+}
+
+/** 413 切分没有全部写成：只删本次写出的半批，原批不动。 */
+private fun Engine.rollbackSplit(written: List<String>, original: String) {
+    for (w in written) {
+        if (w == original) continue
+        Fs.remove(File(outboxDir, w))
+        metas.remove(w)
+    }
 }
 
 // MARK: 驱逐（§3.8，宪法 R-5）

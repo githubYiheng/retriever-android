@@ -281,6 +281,10 @@ internal class FakePlatform : Platform {
     @Volatile
     var processName = "main"
     val scheduledJobs = CopyOnWriteArrayList<Int>()
+    val cancelledJobs = CopyOnWriteArrayList<Int>()
+
+    /** 记下 scheduleUploadJob 被调用时所在的线程名（fatal 在调用线程上排作业）。 */
+    val scheduleThreads = CopyOnWriteArrayList<String>()
     val diskAllowances = AtomicInteger()
     val diskRestores = AtomicInteger()
 
@@ -300,7 +304,12 @@ internal class FakePlatform : Platform {
     override fun availableBytes(dir: File): Long? = available
 
     override fun scheduleUploadJob(jobId: Int) {
+        scheduleThreads.add(Thread.currentThread().name)
         scheduledJobs.add(jobId)
+    }
+
+    override fun cancelUploadJob(jobId: Int) {
+        cancelledJobs.add(jobId)
     }
 
     /** 与 AndroidPlatform 同一个实现（纯 JVM）。 */
@@ -325,10 +334,11 @@ internal class Harness(
     val clock: FakeClock = FakeClock(),
     val transport: FakeTransport = FakeTransport(),
     val platform: FakePlatform = FakePlatform(),
+    initialEnabled: Boolean? = null,
 ) {
     val root: File = root ?: tempDir()
     val errors = CopyOnWriteArrayList<Throwable>()
-    val client: RetrieverClient = RetrieverClient(this.root, key, BASE, options, clock, transport, platform).also { c ->
+    val client: RetrieverClient = RetrieverClient(this.root, key, BASE, options, clock, transport, platform, initialEnabled).also { c ->
         c.onInternalError = { t -> errors.add(t) }
     }
 
@@ -403,17 +413,43 @@ internal class Harness(
     val backoff: BackoffState get() = work { it.backoff.copy() }
     val nowMono: Long get() = clock.monoMs()
 
+    /** root 同级的禁用标记（ADR 0020 决定 2）。 */
+    val disabledMarker: File get() = File(root.absoluteFile.parentFile, root.name + ".disabled")
+
+    /** 堵住引擎线程直到 [release]（模拟引擎忙：冷启动恢复、大批物化等）。 */
+    fun blockEngine(): CountDownLatch {
+        val gate = CountDownLatch(1)
+        val entered = CountDownLatch(1)
+        client.workAsync {
+            entered.countDown()
+            gate.await(30, TimeUnit.SECONDS)
+        }
+        entered.await(10, TimeUnit.SECONDS)
+        return gate
+    }
+
+    fun purgeBlocking() {
+        val done = CountDownLatch(1)
+        client.purgeLocal { done.countDown() }
+        if (!done.await(30, TimeUnit.SECONDS)) fail("purgeLocal 回调 30 s 未到")
+        settle()
+    }
+
     companion object {
         const val BASE = "https://logs-test.invalid"
         val LIVE = CopyOnWriteArrayList<Harness>()
 
-        /** 关闭本用例建的全部实例；断言没有内部异常。 */
+        /** 关闭本用例建的全部实例；断言没有内部异常。root 同级的标记 / 清空残留一并删掉。 */
         fun closeAll(expectErrors: Boolean = false) {
             val all = ArrayList(LIVE)
             LIVE.clear()
             val errs = all.flatMap { it.errors }
             for (h in all) h.client.closeForTesting()
-            for (h in all) h.root.deleteRecursively()
+            for (h in all) {
+                h.root.deleteRecursively()
+                val parent = h.root.absoluteFile.parentFile
+                parent?.listFiles()?.filter { it.name.startsWith(h.root.name + ".") }?.forEach { it.deleteRecursively() }
+            }
             if (!expectErrors && errs.isNotEmpty()) {
                 val sw = StringWriter()
                 errs.first().printStackTrace(PrintWriter(sw))

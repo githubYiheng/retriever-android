@@ -3,6 +3,7 @@ package org.revdog.retriever
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.revdog.retriever.core.Ids
 import org.revdog.retriever.core.JsonIn
 import org.revdog.retriever.core.Limits
 import java.io.File
@@ -13,10 +14,11 @@ import java.util.concurrent.TimeUnit
  * N 行全部识别、oseq 连续、出站箱正确、sessions.jsonl 有 unclean_fg 且合成 error 已封段。与 iOS KillTests 同一组。
  */
 class KillTests : RtvTest() {
-    private fun runHelper(root: File, n: Int, torn: Boolean): Pair<Long, Long> {
+    private fun runHelper(root: File, n: Int, torn: Boolean, fatal: Boolean = false): Pair<Long, Long> {
         val java = File(System.getProperty("java.home") ?: "", "bin/java").path
         val cp = System.getProperty("rtv.testClasspath") ?: error("缺 rtv.testClasspath（build.gradle.kts 注入）")
-        val cmd = listOf(java, "-cp", cp, "org.revdog.retriever.KillHelperKt", root.path, n.toString()) + (if (torn) listOf("--torn") else emptyList())
+        val cmd = listOf(java, "-cp", cp, "org.revdog.retriever.KillHelperKt", root.path, n.toString()) +
+            (if (torn) listOf("--torn") else emptyList()) + (if (fatal) listOf("--fatal") else emptyList())
         val p = ProcessBuilder(cmd).redirectError(File("/dev/null")).start()
         val out = String(p.inputStream.readBytes(), Charsets.UTF_8)
         assertTrue(p.waitFor(120, TimeUnit.SECONDS))
@@ -121,6 +123,36 @@ class KillTests : RtvTest() {
         val envs = h.envelopes().filter { it["session_id"] == sid }
         val covered = envs.flatMap { e -> e.lines.filter { it.containsKey("oseq") && it["ctx"] != true }.map { int(it["oseq"]) } }.sorted()
         assertEquals((1L..300L).toList() + 302L, covered)
+        assertAllValid(runValidator(envs))
+    }
+
+    /**
+     * fatal 之后立刻 SIGKILL（封段物化是异步的，来不及做，ADR 0020 决定 1）：重启后 fatal 行已恢复、oseq 连续，
+     * 它所在的批 batch_id = UUIDv5(install:session:primary:oseq_from)，与正常封段时同名。
+     */
+    @Test
+    fun fatalThenKillBeforeSeal() {
+        val root = tempDir("rtv-fatal")
+        val (seq, oseq) = runHelper(root, 2000, false, fatal = true)
+        assertEquals(2001L, seq)
+        assertEquals(201L, oseq)
+        val h = Harness(root = root, key = "")
+        h.settle()
+        val (sid, dir) = oldSession(root, h.client.writer.currentSessionId)
+        val ls = allLines(dir)
+        val fatal = ls.single { it["level"] == "fatal" }
+        assertEquals(2001L, int(fatal["seq"]))
+        assertEquals(201L, int(fatal["oseq"]))
+        assertEquals("合成 unclean_exit 接着编", 202L, int(ls.single { it["tag"] == "rtv.unclean_exit" }["oseq"]))
+        val envs = h.envelopes().filter { it["session_id"] == sid }
+        val ranges = envs.map { Pair(int(it["oseq_from"]), int(it["oseq_to"])) }.sortedBy { it.first }
+        assertEquals(1L, ranges.first().first)
+        assertEquals(202L, ranges.last().second)
+        for (i in 1 until ranges.size) assertEquals(ranges[i - 1].second + 1, ranges[i].first)
+        val carrier = envs.single { e -> e.lines.any { it["level"] == "fatal" && it["ctx"] != true } }
+        assertTrue(carrier.name.startsWith("p0-"))
+        assertEquals(Ids.batchId(h.client.installId!!, sid, Ids.BatchKind.PRIMARY, int(carrier["oseq_from"])), carrier["batch_id"])
+        assertEquals(1, h.readJsonl("sessions.jsonl").count { it["session_id"] == sid })
         assertAllValid(runValidator(envs))
     }
 

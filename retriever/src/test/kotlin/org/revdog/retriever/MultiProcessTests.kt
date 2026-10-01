@@ -61,6 +61,63 @@ class MultiProcessTests : RtvTest() {
         assertEquals(emptyList<String>(), b.outboxFiles())
     }
 
+    /**
+     * 禁用标记在 root 同级、多进程共享（ADR 0020 决定 2）：A 禁用后，B 的上传 / 拉配置在下一次决策时就停（每次决策 stat 一次）；
+     * B 的写入要到它自己调用或重启才停。A 重新启用后 B 照常上传。
+     */
+    @Test
+    fun markerSeenAcrossProcesses() {
+        val root = tempDir()
+        val a = Harness(root = root, key = "") // A 不上传：出站箱共享，免得 A 重新启用时替 B 把批传了
+        a.settle()
+        val b = Harness(root = root, options = Options().apply { processName = "worker" })
+        b.settle()
+        val cfg0 = b.transport.configRequests.size
+        a.client.setEnabled(false)
+        a.settle()
+        assertTrue(a.disabledMarker.exists())
+        assertTrue("B 的内存开关不受影响", b.client.isEnabled)
+        b.client.log(LogLevel.WARN, "b still writes", null, null, null)
+        assertEquals(1L, b.client.debugCounters.second)
+        b.sealAndDrain()
+        assertEquals("disabled", b.client.lastStop.first)
+        assertEquals(0, b.transport.batchRequests.size)
+        b.tick(31L * 60 * 1000)
+        assertEquals("B 也不拉配置", cfg0, b.transport.configRequests.size)
+        a.client.setEnabled(true)
+        a.settle()
+        b.tick(2000)
+        assertEquals(1, b.transport.batchRequests.size)
+        assertEquals(emptyList<String>(), b.outboxFiles())
+    }
+
+    /**
+     * 多进程下 purgeLocal 只保证调用进程（ADR 0019 后果）：B 内存里还是旧 install，但它排空时以每个批自身信封里的 install 上报
+     * （ADR 0019 决定 10），A 清空后写的新 install 的批不会因为「请求头与信封不符」出错。
+     */
+    @Test
+    fun otherProcessUploadsWithEnvelopeInstallAfterPurge() {
+        val root = tempDir()
+        val a = Harness(root = root, key = "")
+        a.settle()
+        val b = Harness(root = root, key = "", options = Options().apply { processName = "worker" })
+        b.settle()
+        val old = a.client.installId
+        a.purgeBlocking()
+        val fresh = a.client.installId!!
+        assertNotEquals(old, fresh)
+        assertEquals("B 内存里的 install 不变（写进 README 的限制）", old, b.client.installId)
+        a.client.log(LogLevel.WARN, "written after purge", null, null, null)
+        a.seal()
+        assertEquals(fresh, a.envelopes().single()["install_id"])
+        b.enableUpload()
+        assertEquals(1, b.transport.batchRequests.size)
+        val r = b.transport.batchRequests[0]
+        assertEquals(fresh, FakeTransport.envOf(r.body)!!["install_id"])
+        assertEquals("请求头 == 信封，不是 B 内存里的旧 install", fresh, r.headers["X-Rtv-Install"])
+        assertEquals(emptyList<String>(), a.outboxFiles())
+    }
+
     @Test
     fun processNameSanitized() {
         assertEquals("main", RetrieverClient.sanitizeProcessName(""))
